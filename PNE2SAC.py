@@ -24,7 +24,7 @@ SOFTWARE.'''
 
 
 __author__ = "Daniel Burk <burkdani@msu.edu>"
-__version__ = "20141106"
+__version__ = "20141107"
 __license__ = "MIT"
 
 # -*- coding: utf-8 -*-
@@ -189,6 +189,12 @@ def main():
                     b[n] = Data[n]
                 t.fromarray(b)
 
+                t.SetHvalue('scale',1.00) # Set the scale. This one is important to declare.
+                t.SetHvalue('idep',4)     # 4 = units of velocity in nm, based on published amplification number
+                # Dependent variable: (1)unknown, (2)displacement(nm), 
+                #                     (3)velocity(nm/sec), (4)velocity(volts), 
+                #                     (5)nm/sec/sec
+
                 t.SetHvalue('delta', Delta)
                 t.SetHvalue('nzyear',St_time.tm_year)
                 t.SetHvalue('nzjday',St_time.tm_yday)
@@ -198,6 +204,10 @@ def main():
                 t.SetHvalue('nzmsec', Frac_sec)
                 t.SetHvalue('kstnm',Stname[:7])
                 t.SetHvalue('kcmpnm',Component)
+                t.SetHvalue('kinst','Velocity')       # Instrument type
+                t.SetHvalue('knetwk','MSUPNE  ')      # Network designator
+                t.SetHvalue('kuser0','nanometr')      # Place the system of units
+
                 t.WriteSacBinary(outfile)
 
                 print "File written to {}".format(outfile)
