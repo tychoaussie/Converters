@@ -26,12 +26,15 @@ SOFTWARE.'''
 
 
 __author__ = "Daniel Burk <burkdani@msu.edu>"
-__version__ = "20141110"
+__version__ = "20150817"
 __license__ = "MIT"
 
 # -*- coding: utf-8 -*-
 
 # Beta version to try and bring in calibrations, if they exist.
+# 20150817 - updated to run on latest Obspy version plus bring in channel names into
+# the SAC filename. Also correct the start time bug by using the encoded start time
+# from the first two samples of the timing signal.
 
 import sys, os, csv, time, string, numpy as np
 from obspy.core import read, Trace, Stream, UTCDateTime
@@ -160,11 +163,16 @@ def convert(infile,outfile):
     header = vdaq(headerfile)
     Samplecount = header['RecordPts:']
 
+
         # Extract the start time to the nearest second from the file name
         # File name is an established standard of 14 characters
         # hexfile[-18:-4] represents st.tiome to nearest second
         # 20130314000509
-    St_time = time.strptime(hexfile[-18:-4],"%Y%m%d%H%M%S")
+        # Note!! This is computer system time, NOT the start time. So don't do this.
+        # Use the start time as encoded within the timing channel (channel 0) as found
+        # within the first two samples.
+
+        #    St_time = time.strptime(hexfile[-18:-4],"%Y%m%d%H%M%S")
  
             # Import the binary data
             # Each channel sample comprises of four bytes
@@ -184,8 +192,16 @@ def convert(infile,outfile):
 
 
     Data = np.fromfile(hexfile,dtype = dt)      # load all data from the binary file using our specified format dt
-            #
-            # Note that Data is simply a list of raw counts from the ADC and is a 32 bit integer value.
+
+            # Data[0][0] represents MSBaLSBa 0000 of epoch start time from gps
+            # Data[1][0] represents MSBbLSBb 0000 of epoch start time from gps
+            # Epoch start time must be arranged thus: MSBa LSBa MSBb LSBb            
+    data = []
+    data.append(Data[0][0]) # MSB of start time from file
+    data.append(Data[1][0]) # LSB of start time from file
+    timestamp = long(int(data[0])<<16|int(data[1])) # Assemble them into the timestamp
+    St_time = time.gmtime(timestamp) # Convert them into a tuple representing start time to nearest second
+            # Note that rest of the Data is simply a list of raw counts from the ADC and is a 32 bit integer value.
             # It would be nice if each channel was converted to a measurement in terms of volts as a float value.
             # The Symres PAR4CH system is 24 bits for +-10V, and the USB4CH is listed as +-4V
             # but practical measurements in the lab put it more like +-8V. 
@@ -283,6 +299,7 @@ def convert(infile,outfile):
         t.SetHvalue('nzmsec', int(Frac_second*1000))
         t.SetHvalue('kstnm',header['A-DInfo:'])
         t.SetHvalue('kcmpnm',header["Ch{}ID:".format(i)])
+#        print "Channel name is listed as '{}'".format(header["Ch{}ID:".format(i)])
         t.SetHvalue('idep',4) # 4 = units of velocity (in Volts)
                               # Dependent variable choices: (1)unknown, (2)displacement(nm), 
                               # (3)velocity(nm/sec), (4)velocity(volts), 
@@ -291,8 +308,13 @@ def convert(infile,outfile):
         t.SetHvalue('knetwk','OUT2SAC ')         # Network designator
         t.SetHvalue('kuser0',units[i-1])        # Place the system of units into the user text field 0
 
-        t.WriteSacBinary(outfile+"_{}.sac".format(i))
-        print " File successfully written: {0}_{1}.sac".format(outfile,i)
+        f = outfile+"_{}.sac".format(header["Ch{}ID:".format(i)])
+#        print "filename for SACoutput file = '{}'".format(f)
+        with open(f,'wb') as sacfile:
+            t.WriteSacBinary(sacfile)
+        print " File successfully written: {0}_{1}.sac".format(outfile,header["Ch{}ID:".format(i)])       
+        sacfile.close()
+
 
 
 
