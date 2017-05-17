@@ -24,7 +24,7 @@ SOFTWARE.'''
 
 
 __author__ = "Daniel Burk <burkdani@msu.edu>"
-__version__ = "20141107"
+__version__ = "20160613"
 __license__ = "MIT"
 
 # -*- coding: utf-8 -*-
@@ -57,8 +57,8 @@ __license__ = "MIT"
 # OF SUCH DAMAGES.
 
 import os, csv, sys, numpy as np, time, string
-from obspy.core import read, Trace, Stream, UTCDateTime
-from obspy.sac import SacIO
+from obspy.core import read
+from obspy.io.sac import SACTrace
 
 class ASCconvertError(Exception):
 
@@ -107,7 +107,30 @@ class ASCconvert(object):
 # 
 # Two lists are returned: SAChead, and Data
 #
-
+#
+# Each text file must contain a header with the following seven columns:
+#
+#    COMMENT Neva-2-2-Stolb-409_600dpi
+#    STATION STOLB
+#    COMPONENT Z
+#    REFTIME   24_JUL_1987_02:03:00.000
+#    STARTTIME 24_JUL_1987_02:02:58.500
+#    CF 25000
+#    TC -1.5
+#
+#    followed by the data fields:
+#
+#    120.000000	4.360000
+#    120.050000	4.359900
+#  
+#    ...etc.
+#    Note that the first column consists of time, in seconds, following STARTTIME.
+#    TC is the correction factor; A number of seconds forward or backward by which 
+#    we need to adjust REF time to yield the START time.
+#    We manually calculate START time by applying Time correction factor TC to REFTIME.
+#    It is a manual calculation because I couldn't figure out how to apply it in Python
+#    at the time I first created this program.
+#
 
 def load(infile):
     with open(infile,'r') as fin:
@@ -116,13 +139,14 @@ def load(infile):
         stack = []
         header = []
         for row in list:
-            r = row[0].split()
-            if rowcnt < 7:
-                header.append(r)
-                rowcnt +=1
-            else:
-                stack.append(r)
-                rowcnt+=1
+            if len(row) > 0:
+                r = row[0].split()
+                if rowcnt < 7:
+                    header.append(r)
+                    rowcnt +=1
+                else:
+                    stack.append(r)
+                    rowcnt+=1
                 
         return(header,stack)
 
@@ -177,66 +201,84 @@ def main():
 
                 if string.find(infile,'.') > 0:
                     outfile = infile[:string.find(infile,'.')]+'.sac'
+                    seedfile = infile[:string.find(infile,'.')]+'.mseed'
                 else:
                     outfile = infile +'.sac'
+                    seedfile = infile + '.mseed'
 
-                PNE = load(infile)
+                PNE       = load(infile)
 
-                Comment = PNE[0][0][1]
-                Stname = PNE[0][1][1][:7]
+#                        PNE[0] is the header where:
+#                        PNE[0][0][1] = The comment descriptor of the data
+#                        PNE[0][1][1] = The station name
+#                        PNE[0][2][1] = Component axis(Z,N, or E)
+#                        PNE[0][4][1] = Start time
+#                        PNE[0][5][1] = Calibration factor
+#                        PNE[0][6][1] = Time correction in seconds
+
+                Comment   = PNE[0][0][1]
+                Stname    = PNE[0][1][1][:7]
                 Component = PNE[0][2][1][:3]
-                St_time = time.strptime(PNE[0][4][1][:-4],"%d_%b_%Y_%H:%M:%S")
-                Frac_sec = int(PNE[0][4][1][21:])
-                CF = np.float32(PNE[0][5][1])
+                St_time   = time.strptime(PNE[0][4][1][:-4],"%d_%b_%Y_%H:%M:%S")
+                Frac_sec  = int(PNE[0][4][1][21:])
+                CF        = np.float32(PNE[0][5][1])
 
-                TC = PNE[0][6][1]
-                Offset = float(PNE[1][0][0])
+                TC        = PNE[0][6][1] # time correction
+
+                Offset    = float(PNE[1][0][0])
 #
 #                       Delta is calculated from the offset time of last sample 
 #                       minus offset of first sample / total number of samples.
 
             
-                Delta = (float(PNE[1][len(PNE[1])-1][0])-Offset)/(len(PNE[1])-1)
+                Delta     = (float(PNE[1][len(PNE[1])-1][0])-Offset)/(len(PNE[1])-1)
 
 #                       Load Data array
 #                       Samples in file are multiplied by 10,000 to convert from
 #                       measurements of centimeters to microns, then it's divided by
 #                       the Amplification (conversion) factor, known as CF
 
-                Data = []
+                Data     = []
                 for n in range (len(PNE[1])-1):
                     Datum = np.float32(np.float32(PNE[1][n][1])*10000.0/CF)
                     Data.append(Datum)
-                t = SacIO()
-                b = np.arange(len(Data),dtype=np.float32)
+                
+                b        = np.arange(len(Data),dtype=np.float32)
                 for n in range(len(Data)): #   Load the array with time-history data
                     b[n] = Data[n]
-                t.fromarray(b)
 
-                t.SetHvalue('scale',1.00) # Set the scale. This one is important to declare.
-                t.SetHvalue('idep',4)     # 4 = units of velocity in nm, based on published amplification number
-                # Dependent variable: (1)unknown, (2)displacement(nm), 
-                #                     (3)velocity(nm/sec), (4)velocity(volts), 
-                #                     (5)nm/sec/sec
+                t        = SACTrace(data = b)         
+                                             # set the SAC header values
+                t.scale  = 1.0               # Set the scale for use with DIMAS software
+                t.delta  = Delta
+                t.nzyear = St_time.tm_year
+                t.nzjday = St_time.tm_yday
+                t.nzhour = St_time.tm_hour
+                t.nzmin  = St_time.tm_min
+                t.nzsec  = St_time.tm_sec
+                t.nzmsec = Frac_sec          # int((Frac_second)*1000)
+                t.kstnm  = Stname[:7]
+                t.kcmpnm = Component
+                t.IDEP   = 4                 # 4 = units of velocity (in Volts)
+                                             # Dependent variable choices: 
+                                             # (1)unknown, 
+                                             # (2)displacement(nm), 
+                                             # (3)velocity(nm/sec), 
+                                             # (4)velocity(volts), 
+                                             # (5)nm/sec/sec
+                t.kinst  = "Velocity"        # Instrument type
+                t.knetwk = "LM"              # Network designator
+                t.kuser0 = "Nanometr"        # Place the system of units into the user text field 0
 
-                t.SetHvalue('delta', Delta)
-                t.SetHvalue('nzyear',St_time.tm_year)
-                t.SetHvalue('nzjday',St_time.tm_yday)
-                t.SetHvalue('nzhour',St_time.tm_hour)
-                t.SetHvalue('nzmin',St_time.tm_min)
-                t.SetHvalue('nzsec', St_time.tm_sec)
-                t.SetHvalue('nzmsec', Frac_sec)
-                t.SetHvalue('kstnm',Stname[:7])
-                t.SetHvalue('kcmpnm',Component)
-                t.SetHvalue('kinst','Velocity')       # Instrument type
-                t.SetHvalue('knetwk','MSUPNE  ')      # Network designator
-                t.SetHvalue('kuser0','nanometr')      # Place the system of units
-
-                t.WriteSacBinary(outfile)
-
+#                t.WriteSacBinary(outfile)
+                with open(outfile,'wb') as sacfile:
+                    t.write(sacfile)
+                print " File successfully written: {0}".format(outfile)       
+                sacfile.close()
+                st=read(outfile)
+                st.write(seedfile,format="mseed")
+                print " File successfully written: {0}".format(seedfile)
                 print "File written to {}".format(outfile)
-            else:
-                print "{} not processed.".format(filelist[n])
         
     else:
         print "Useage: PNE2SAC infile.txt (outfile.asc)"
