@@ -24,7 +24,7 @@ SOFTWARE.'''
 
 
 __author__ = "Daniel Burk <burkdani@msu.edu>"
-__version__ = "20200205"
+__version__ = "20200831"
 __license__ = "MIT"
 
 # -*- coding: utf-8 -*-
@@ -91,6 +91,20 @@ class ASCconvert(object):
        <ObsPy> C:\Python27\scripts> python PNE2SAC.py C:/seismic/PNE 
 
     '''
+# Version 20200831: Accomodate dates earlier than 1970
+#         20200813: Polarity set to 1.0 in this code
+# Version 20200730: Add minor bug fix in def load() for when incoming text files contain blank lines with spaces inside.
+# Version 20200829: Add a total to the number of discontinuities found in the wavetrack output that need
+#                   correction, and place this information into the graph.
+# Version 20200504: Fixed the start time fraction of second Frac_sec which was incorrect.
+#                   Also, the graph now gets save by default. Polarity has been corrected, as well. 
+#                   Future changes:  The text log will also be saved by default,
+#                   and filename will be time coded with the time of miniseed generation.
+#                   Make the SAC file format an OPTION, and only output it when directed with a '-SAC' switch. 
+#                   Add Polarity awareness. Does a negative-going wavetrack measurement represent a positive
+#                   or a negative-going waveform? In any event, make lower-going values reflect POSITIVE as default.
+# Version 20200318: Add in the Mouseclick file output that provides the interpolated mouse clicks.
+# Version 20200217: Minor changes to how the start time is generated (specifically the first sample offset)
 # version 20200205: Move to processing the header information differently. Use the "REFTIME"
 #                   to represent the relative time (on the seismogram) of the first sample in the file
 #                   Then, user "STARTTIME" to indicate the relative time on the seismogram where to start
@@ -175,16 +189,17 @@ def load(infile):                 # Collate the file into header information and
         list = csv.reader(fin)
         rowcnt = 0
         stack = []
-        header = []
+        header = {'comment':'','station':'','network':'','component':'','reftime':'01_JAN_1970_00:00:00.000', \
+        'starttime':'01_JAN_1970_00:00:00.000','cf':'1.0','tc':'0.0'}
         for row in list:
             if len(row) > 0:          # skip blank lines
                 r = row[0].split()    # First seven rows are header and assigned to PNE[0]
-                if rowcnt < 8:
-                    header.append(r)
-                    rowcnt +=1
-                else:                 # Stack represents data and is assigned to PNE[1]
-                    stack.append(r)
-                    rowcnt+=1
+                if len(r) > 1:
+                    if  r[0].lower() in header.keys():
+                        header[r[0].lower()] = r[1]    # rowcnt < 8:
+                        print(f' Dict item {r[0]} set to {r[1]}')
+                    else:                 # Stack represents data and is assigned to PNE[1]
+                        stack.append(r)
                 
         return(header,stack)
 
@@ -336,7 +351,7 @@ def Pchip(time,amp): # input the time and amplitude series. method describes the
     x_data = np.array(clicktime)
     y_data = np.array(clickamp)
 
-    Pchip_time = np.linspace(min(x_data), max(x_data), len(slopes))
+    Pchip_time = np.linspace(min(x_data), max(x_data), len(slopes)) # From the oldest time to the youngest time, space out 'n' points, as specified in len(slopes)
     bi = interpolate.PchipInterpolator(x_data, y_data)
     Pchip_amplitude = bi(Pchip_time)
     return(Pchip_time,Pchip_amplitude,clicktime,clickamp,errtime)
@@ -347,48 +362,34 @@ def Pchip(time,amp): # input the time and amplitude series. method describes the
 def main():
 #                               Parse the command line switches
     optioncount = len(sys.argv)
+    Folder = False
     SAC = False
-    CFflag = False
+    Sps = 100
     outputfile_defined = False
     filelist = []
     dir=""
     extension = '.txt'
     if optioncount > 1:
-
-        if optioncount == 4:
-            if sys.argv[3] == '-s':
+        for i,args in enumerate(sys.argv): # Check to see if alternate sample rate is specified
+            if '-sps' in args.lower():
+                Sps = float(args[4:])
+                print(f'Sample rate requested = {Sps} samples per second')
+            elif '-sac' in args.lower():
                 SAC = True
-            if sys.argv[3] == '-cf':
-                CFflag = True
-            outfile = sys.argv[2]
-            infile = sys.argv[1]
-            filelist.append(infile)
-
-        elif optioncount == 3:
-            if "." in sys.argv[1]:
-                
-                infile = sys.argv[1]
+            elif '-folder' in args.lower():
+                try:
+                    Folder = True # This means the first instance following folder represents the folder name.
+                    dir = sys.argv[i+1]
+                    filelist = os.listdir(sys.argv[i+1])
+                except:
+                    print("Warning! No folder specified within arguments. Check syntax.")
+            elif '.' in args.lower() and i!=0: # A file name has been specified.
+                infile = args
                 filelist.append(infile)
-                outputfile_defined = True
-                outfile = sys.argv[2]
-            else:
-                if len(sys.argv[2])==4 and "." in sys.argv[2]: # set a different extension
-                    extension = sys.argv[2]
-                filelist = os.listdir(sys.argv[1])
-                dir=sys.argv[1]
-            
-        elif optioncount == 2:
-            if "." in sys.argv[1]:
-                infile = sys.argv[1]
-                filelist.append(infile)
-            else:
-                dir = sys.argv[1]
-                filelist = os.listdir(sys.argv[1])
 
         outfolder = ".\\"                          # Assume user has specified a local file
         if infile.rfind("\\") > 1:                 # unless a folder is in the name.
             outfolder = infile[:infile.rfind("\\")]
-
 
         for n in range(len(filelist)):
             if extension in filelist[n]:
@@ -406,7 +407,7 @@ def main():
                 if infile.rfind("\\") > 1:                 # unless a folder is in the name.
                     outfolder = infile[:infile.rfind("\\")]
 
-                PNE       = load(infile)
+                metadata,PNE       = load(infile)
 
 
 #                        PNE[0] is the header where:
@@ -422,17 +423,28 @@ def main():
 #                        Process PNE[0] differently now, so it's not related to order, just in case
 #                        something (like network) ends up blank or missing.
 
-                metadata  = {'comment':'','network':'','station':'','component':'','reftime':'01_JAN_1970_00:00:00.000', \
-                             'starttime':'01_JAN_1970_00:00:00.000','cf':1.0,'tc':0.0}
-                for data in PNE[0]: # Load the dictionary with the stuff in the header
-                    if data:
-                        metadata[data[0].lower()] = data[1]                
+
+                # Correct for times that are earlier than 1970
+                #
+                starttime_adjusted = False
+                reftime_adjusted = False
+                true_starttime_year = int(metadata['starttime'][7:11]) 
+                true_reftime_year = int(metadata['reftime'][7:11])
+
+                if(true_starttime_year < 1970):
+                    metadata['starttime'] = metadata['starttime'][0:7]+'1970'+metadata['starttime'][11:]
+                    starttime_adjusted = True
+
+                if(true_reftime_year < 1970):
+                    metadata['reftime'] = metadata['reftime'][0:7]+'1970'+metadata['reftime'][11:]
+                    reftime_adjusted = True
+                #
                 Comment   = metadata['comment'] 
                 Network   = metadata['network'] 
                 Stname    = metadata['station'][:7] 
                 Component = metadata['component'][:3] 
                 CF        = np.float32(metadata['cf']) # Amplification of the system (crest factor) (now unused)
-                first_sampletime    = float(PNE[1][0][0])# Number of seconds ahead of the ref_time in which the first sample actually occurs
+                first_sampletime    = float(PNE[0][0])# Number of seconds ahead of the ref_time in which the first sample actually occurs
 #                                                          In New digitizations, first_sampletime is expected to be zero.
                 Ref_time  = time.strptime(metadata['reftime'][:-4],"%d_%b_%Y_%H:%M:%S") # Tuple. This is apparent time of 1st digitized sample from the seismogram.
                 Ref_time_Frac_sec = float(metadata['reftime'][20:])
@@ -440,20 +452,21 @@ def main():
                 Start_time_Frac_sec  = float(metadata['starttime'][20:])
                 TC        = float(metadata['tc'])               # time correction constant from the seismogram that corrects apparent time to actual GMT
 
-
-                reftime = calendar.timegm(Ref_time)+Ref_time_Frac_sec+float(first_sampletime) # Add the offset from the first sample and TC to reftime.
-                starttime = calendar.timegm(Start_time)+Start_time_Frac_sec+float(first_sampletime) # Add the offset from the first sample to starttime.
+                Polarity = 1.0 # -1.0 Default value for Wavetrack outputs to make negative measurements create positive seismograms.
+                reftime = calendar.timegm(Ref_time)+Ref_time_Frac_sec #+float(first_sampletime) # Add the offset from the first sample and TC to reftime.
+                starttime = calendar.timegm(Start_time)+Start_time_Frac_sec #+float(first_sampletime) # Add the offset from the first sample to starttime.
+                print(f'Starttime is calculated as: {starttime}')
                 St_time = time.gmtime(starttime+TC)   # This is a tuple representing the corrected start time in GMT
                 DeltaT = starttime - reftime  # time (in seconds) representing the data to be discarded at the beginning of stream  
-                Starting_sample = float(DeltaT + first_sampletime)
-
+                Starting_sample = float(DeltaT ) # + first_sampletime)
+                Frac_second = int(((starttime+TC) - (int(starttime+TC)))*1000) # Expressed in milliseconds
 
 #
 #                       Delta is the average sample period. It is calculated from the offset time of last sample 
 #                       minus offset of first sample / total number of samples.
 
             
-                Delta     = (float(PNE[1][len(PNE[1])-1][0])-first_sampletime)/(len(PNE[1])-1)
+                Delta     = (float(PNE[len(PNE)-1][0])-first_sampletime)/(len(PNE)-1)
 
 #                       Load Data array
 #                       Samples in file are (no longer) multiplied by 10,000 to convert from
@@ -467,10 +480,10 @@ def main():
 #                                    Starting_sample is the index time representing the requested start time
 #                                    Any samples that precede this index time are NOT added to the stream.
 #
-                for data in PNE[1]:
+                for data in PNE:
                     if float(data[0]) >= (Starting_sample):  # Discard the unwanted samples from beginning of file 
                         PNEtime.append(float(data[0]))
-                        PNEamplitude.append(float(data[1]))
+                        PNEamplitude.append(2-float(data[1])*Polarity)
 
 #
 #                Process file for click points, then interpolate into smoother waveform
@@ -481,6 +494,22 @@ def main():
                 PNEamp = polynomial(PNEamp, order = 1, plot = False) # polynomial linear trend remove the offset.
  
                 PNE_time,PNE_amp,PNEclicktime,PNEclickamp,errtime = Pchip(PNEtime,PNEamp)
+#
+#               Prepare a list of UTC corrected times that correspond to the click points.
+#
+                PNE_clicktime = [(sample - Starting_sample)+starttime+TC for sample in PNEclicktime] # Careful: Contains pythonics!
+                Clicktime = []
+                for click in PNE_clicktime:
+                    remainder = str(round(float(click-int(click)),3))[-4:]
+
+                #    String theory: Convert time of click into a tuple, then into text. Then convert it's fraction of second
+                #    remainder into an integer number representing milliseconds, and format it so its always three numbers long
+                #    and then glue it all together into a string.
+
+                    Clicktime.append((time.strftime('%Y.%m.%dT%H:%M:%S',time.gmtime(click))+'.' \
+                                      +f'{int(round(float(click)-int(click),3)*1000):03.0f}'))
+    
+
 
                 b        = np.arange(len(PNE_amp),dtype=np.float32)
                 for n in range(len(PNE_amp)):                        #   Load the array with time-history data
@@ -488,9 +517,12 @@ def main():
 
 
                 print( "Sample rate = {0:2.3f} \nNumber of samples = {1} \nFirst_sampletime = {2} seconds, last_sampletime = {3:2.3f} seconds".format( \
-                       1/Delta,len(b),first_sampletime,float(PNE[1][len(PNE[1])-1][0])))
+                       1/Delta,len(b),first_sampletime,float(PNE[len(PNE)-1][0])))
                 print(f'Starting sample for the time slice occurs at {Starting_sample} seconds.') 
-#
+                print(f"St_time = {St_time.tm_hour}:{St_time.tm_min}:{St_time.tm_sec}.{int(metadata['starttime'][21:])}")
+                print(f"Time correction = {TC}")
+                print(f"Frac_Second = {Frac_second}")
+                print(f"starttime = {starttime}")
 #                                            Create the SAC stream
 #
 
@@ -503,7 +535,7 @@ def main():
                 t.nzhour = St_time.tm_hour
                 t.nzmin  = St_time.tm_min
                 t.nzsec  = St_time.tm_sec
-                t.nzmsec = int(metadata['starttime'][21:])          # int((Frac_second)*1000)
+                t.nzmsec = Frac_second          # int((Frac_second)*1000)
                 t.kstnm  = Stname[:7]
                 t.kcmpnm = Component
                 t.IDEP   = 2                 # 4 = units of velocity (in Volts)
@@ -516,9 +548,36 @@ def main():
                 t.kinst  = "Displace"        # Instrument type
                 t.knetwk = Network #         # Network designator
                 t.kuser0 = "CM"        # Centimeters. Place the system of units into the user text field 0
+                #
+                # Correct for the start time, if it precedes 1970
+                if starttime_adjusted:
+                    t.nzyear = true_starttime_year
 
-                filename = Stname[:7]+"."+Network+".."+Component+"."+time.strftime('%Y.%m.%d.%H.%M.%S', St_time)
+                filename = Stname[:7]+"."+Network+".."+Component+"."+str(t.nzyear)+time.strftime('.%m.%d.%H.%M.%S', St_time)
                 outfile = os.path.join(outfolder,filename+".sac")
+
+#
+#               Write the mouse click file, then write out the SAC file.
+#
+                clickfile =  os.path.join(outfolder,filename+"_clickpoints.csv")
+                with open(clickfile, mode='w', newline='\n') as mouseclick:
+                    mouseclick_writer = csv.writer(mouseclick, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
+                    mouseclick_writer.writerow(['COMMENT',metadata['comment']])
+                    mouseclick_writer.writerow(['STATION',metadata['station']])
+                    mouseclick_writer.writerow(['NETWORK',metadata['network']])
+                    mouseclick_writer.writerow(['COMPONENT',metadata['component']])
+                    mouseclick_writer.writerow(['CF',metadata['cf']])
+                    mouseclick_writer.writerow(['TC',metadata['tc']])
+                    mouseclick_writer.writerow(['REFTIME',metadata['reftime']])
+                    mouseclick_writer.writerow(['STARTTIME',metadata['starttime']])
+                    mouseclick_writer.writerow([])
+                    mouseclick_writer.writerow(['Absolute_time(UTC)','Relative_time(seconds)','Amplitude(Centimeters)'])
+                    for i, mouseclicks in enumerate(Clicktime,0):
+                        mouseclick_writer.writerow([mouseclicks,f'{(PNEclicktime[i]-PNEclicktime[0]):003.003f}',PNEclickamp[i]])
+                print ("Mouseclick file successfully written: {0}".format(clickfile))
+#
+#               Write the SAC file
+#
                 with open(outfile,'wb') as sacfile:
                     t.write(sacfile)
                 print (" File successfully written: {0}".format(outfile))       
@@ -536,9 +595,9 @@ def main():
 
                 st=read(outfile)
                 seedfile = os.path.join(outfolder,filename+".mseed")
+                plotfile = os.path.join(outfolder,filename+".png")
                 st.write(seedfile,format="mseed")
                 print (" File successfully written: {0}".format(seedfile))
-                print ("File written to {}".format(outfile))
 
                 plt.figure(figsize=(15,5))
                 plt.title(f'Wavetrack vs. PCHIP plot for {filename}')
@@ -549,6 +608,9 @@ def main():
                 plt.plot(PNE_time, b,c='red',label = "PCHIP interpolation")
                 plt.bar(errtime, height = 5, width=.02, bottom=-2.5, align='center',color = "green",fill=False)
                 plt.legend()
+                errors = "Number of discontinuities in this file = "+str(len(errtime))
+                plt.text(PNE_time[0],np.min(b),errors)
+                plt.savefig(plotfile)
                 plt.show()
         
     else:
