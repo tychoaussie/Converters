@@ -1,0 +1,65 @@
+PNE2SAC revision 2 has several new (optional) header switches that you can add to your wavetrack output file.
+They control the optimization algorithm.
+If they are omitted, the optimizer will run on default values, but will still generate the original, unmodified waveform.
+
+Here is an example. Modify it to fit your particular event.
+Note that the new fields of Optimize, threshold, breakpoint, and shiftlimit are each OPTIONAL. If omitted, the program will pick the default value and use it.
+
+Optimization defaults will change, likely as we gain more experience as a team.
+
+For now, as of 28April, they are as follows:
+optimize False
+threshold 8.0              (Typical values that seem to work best will range between 30 and 50)
+breakpoint 16              (16 Hz is good, and probably does not need to be adjusted.)
+shiftlimit 0.085           ( Shiftlimit should be kept between 0.042 and 0.252)
+
+optimize can be either False or True
+threshold is a ratio of peak amplitude in the trigger channel versus it's overall mean.
+breakpoint is the high pass filter frequency that is applied to the trigger channel. This should lie well above the passband of the seismic channel represented by the digitization.
+shiftlimit is maximum time, in seconds, in which a clickpoint can be moved from it's original position. Bigger values result in large changes to the waveform.
+
+For reference, a 600DPI scan of a 60mm/sec seismogram has 23.6 pixels per second of resolution in the time domain.
+Therefore, a pixel typically represents 0.042 seconds of time. Therefore, .042 seconds of movement represents moving a clickpoint
+one pixel (in this example.). 0.085 as a default means the clickpoint is allowed to be moved about two pixels in order to minimize the
+spike in the derivative. Usually there are two click points involved, so it's possible one might get moved two pixels back in time, and the other
+two pixels forward in time. This is usually sufficient movement to correct for small distortions in a manual digitization. Any more movement than this
+is usually indicative of a digitization that has a lot of asymmetry due to improper image rotation, and this should be fixed in wavetrack.
+
+
+Procedure:
+Run PNE2SAC. Observe how many click points get moved. Adjust threshold up or down until there are only a dozen or two clickpoints
+that get moved. If there are major issues with the file, use the text output as a guide for finding and correcting the points in the
+wavetrack file. Then, re-export the wavetrack file, and re-run PNE2SAC. 
+
+
+First-pass QC should NOT use optimize True to modify the miniseed, but instead use it as a guide to improve the wavetrack file.
+After first-pass QC is satisfied with the waveform, re-run PNE2SAC one final time and direct the output to a LOG file:
+
+(Obspy3.7) D:\Seismo\>pne2sac 1970-DEC-12T070059_OBN_SKD_ELZ.txt > MANGLYSHAK2_OBN_HLZ.LOG
+
+Note the carrot ">" will direct the text into a text file called MANGLYSHAK2_OBN_HLZ.LOG 
+This file provides guidance on the clickpoints that have exceeded the trigger threshold, and makes it easier to find the glitches in Wavetrack.
+
+It will be also used by second-pass QC operator to review the record.
+
+Second-pass QC 
+Present policy is to NOT modify the final miniseed file with the optimization routine on the first pass. However,
+during second-pass QC, policy has not yet been determined. It may be useful for auto-correction of minor problems,
+especially if there are very few clickpoints that need to be adjusted. (a dozen or less). For now, use the optimizer
+for identification of clickpoints, then review them in wavetrack. Be careful not to let the shiftlimit value get too high.
+
+
+------------------- 
+
+COMMENT 1969-SEP-26T06-59-58_Stavropol
+NETWORK RU
+STATION OBN
+COMPONENT EHZ
+REFTIME   26_SEP_1969_07:02:00.000
+STARTTIME 26_SEP_1969_07:02:20.500
+CF 45400
+TC 0.0
+optimize False
+threshold 8.0
+breakpoint 16.0
+shiftlimit 0.260
