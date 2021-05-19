@@ -24,7 +24,7 @@ SOFTWARE.'''
 
 
 __author__ = "Daniel Burk <burkdani@msu.edu>"
-__version__ = "20210428"
+__version__ = "20210519"
 __license__ = "MIT"
 
 # -*- coding: utf-8 -*-
@@ -91,6 +91,7 @@ class ASCconvert(object):
        <ObsPy> C:\Python27\scripts> python PNE2SAC.py C:/seismic/PNE 
 
     '''
+# version 20210519: Fix the SAC timing that was missing the time correction constant.
 # version 20210428: Revision 2.0 includes:
 #                   Waveform analysis and optimization algorithm, support of clickpoint input files
 #                   Revised plot of before/after, improved miniseed file generation
@@ -380,8 +381,32 @@ def Import_clickfile(clickfile):
     return(clicktime,clickamp,errtime,metadata,Time_params)
 
 
+def Export_clickfile(metadata,clicktime,clickamp):
+#
+#               Write the mouse click file.
+#
+    clickfile = os.path.join(metadata['outfolder'],(metadata['filename']+"_clickpoints.csv"))
+    with open(clickfile, mode='w', newline='\n') as mouseclick:
+        mouseclick_writer = csv.writer(mouseclick, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
+        mouseclick_writer.writerow(['COMMENT',metadata['comment']])
+        mouseclick_writer.writerow(['STATION',metadata['station']])
+        mouseclick_writer.writerow(['NETWORK',metadata['network']])
+        mouseclick_writer.writerow(['COMPONENT',metadata['component']])
+        mouseclick_writer.writerow(['CF',metadata['cf']])
+        mouseclick_writer.writerow(['TC',metadata['tc']])
+        mouseclick_writer.writerow(['REFTIME',metadata['reftime']])
+        mouseclick_writer.writerow(['STARTTIME',metadata['starttime']])
+        mouseclick_writer.writerow(['OPTIMIZE',metadata['optimize']])
+        mouseclick_writer.writerow(['THRESHOLD',metadata['threshold']])
+        mouseclick_writer.writerow(['SHIFTLIMIT',metadata['shiftlimit']])
+        mouseclick_writer.writerow(['BREAKPOINT',metadata['breakpoint']])
+        mouseclick_writer.writerow([])
+        mouseclick_writer.writerow(['Clickpoint','Relative_time(seconds)','Amplitude(centimeters)'])
+        for i, mouseclicks in enumerate(clicktime,0):
+            mouseclick_writer.writerow([i,f'{(clicktime[i]-clicktime[0]):003.003f}',clickamp[i]])
+    print ("Mouseclick file successfully written: {0}".format(clickfile))
 
-
+#
 # Load a wavetrack output file with header.
 # header contains the necessary metadata
 # stack contains two element list, of time in seconds since first sample, amplitude in centimeters.
@@ -663,21 +688,8 @@ def Pchip(clicktime,clickamp,nsamples): # Bring in clickpoints and output a PCHI
     return(Pchip_time,Pchip_amplitude)
 
 def Create_sacstream(b,metadata,time_params,outfolder):
-    #
-    #variables needed to generate the sac file
-    # b = datastream
-    # Delta (found in metadata?)
-    # St_time (might be adjusted)
-    # starttime_adjusted (True/False)
-    # true_starttime_year
-    # Frac_second
-    # Stname (found in metadata)
-    # Component (found in metadata)
-    # Location (found in metadata)
-    # Network (found in metadata)
-    # outfolder
-    #                                            Create the SAC stream
-    St_time = time_params['St_time']            # Shortcut for filename below
+    #                                          Create the SAC stream
+    St_time = time_params['St_time']  + float(metadata['tc'])          # Shortcut for filename below
     #
     Delta     = (1/float(metadata['samplerate']))
     Network   = metadata['network']
@@ -688,12 +700,12 @@ def Create_sacstream(b,metadata,time_params,outfolder):
                                  # set the SAC header values
     t.scale  = 1.0               # Set the scale for use with DIMAS software
     t.delta  = Delta
-    t.nzyear = time_params['St_time'].year
-    t.nzjday = time_params['St_time'].julday
-    t.nzhour = time_params['St_time'].hour
-    t.nzmin  = time_params['St_time'].minute
-    t.nzsec  = time_params['St_time'].second
-    t.nzmsec = time_params['St_time'].microsecond/1000          # int((Frac_second)*1000)
+    t.nzyear = St_time.year
+    t.nzjday = St_time.julday
+    t.nzhour = St_time.hour
+    t.nzmin  = St_time.minute
+    t.nzsec  = St_time.second
+    t.nzmsec = St_time.microsecond/1000          # int((Frac_second)*1000)
     t.kstnm  = metadata['station'][:7]
     t.kcmpnm = metadata['component']
     t.khole  = metadata['location']
@@ -723,7 +735,7 @@ def Create_sacstream(b,metadata,time_params,outfolder):
     #
     with open(outfile,'wb') as sacfile:
         t.write(sacfile)
-    print (" File successfully written: {0}".format(outfile))       
+    print (" File successfully written: {0} with a start time of {1}".format(outfile,St_time))       
     sacfile.close()
     return(t) #  This is the trace that was just written to disk.
 
@@ -756,18 +768,6 @@ def Maketrace(streamdata,metadata,time_params):
     tr.stats['starttime'] = time_params['St_time']+float(metadata['tc']) # Add the time correction here
     return(tr)
 
-
-#def Makestream(streamdata,metadata,time_params):
-#    tr = Trace(data=streamdata.astype('float32'))
-#    tr.stats['delta']=metadata['delta']
-#    tr.stats['network'] = metadata['network']
-#   tr.stats['station'] = metadata['station'][:7]
-#   tr.stats['location'] = metadata['location']
-#   tr.stats['channel'] = metadata['component'][:3]
-#   tr.stats['starttime'] = time_params[7]
-#   tr.stats['calib'] = metadata['cf']
-#    st = Stream(traces = tr)
-#    return(st)
 
 
 def PNEplot(PNE,clicktime,clickamp,PNE_time,streamdata,errtime,metadata,time_params):
@@ -813,8 +813,10 @@ def plot_optimized(metadata,time_params,outfolder,tr1,tr2,errtime,streamtime,cli
         waveselect = "optimized"
     else:
         waveselect = "original"
-
-    errors = "Number of discontinuities in this file = "+str(len(errtime))
+    if errtime:
+        errors = "Number of discontinuities in this file = "+str(len(errtime))
+    else:
+        errors = "Sourced from click file."
     adjusteds = "Number of clickpoints that exceed threshold = "+str(len(Clicktime_to_adjust))
     optimized = (f"Optimization algorithm: {metadata['threshold']} x rms trigger w/ {metadata['breakpoint']} Hz highpass filter.")
     shiftlimit = (f"Shift limit = {metadata['shiftlimit']}")
@@ -844,7 +846,7 @@ def plot_optimized(metadata,time_params,outfolder,tr1,tr2,errtime,streamtime,cli
 #    axs[0].xlabel("original vs optimized")
     axs[0].annotate('Original(blue) vs optimized waveform(red)',xy=(xmin+(xmax-xmin)/2.0, np.min(tr2.data)))
     axs[1].annotate('optimized waveform (red)',xy=(xmin+(xmax-xmin)/2.0, np.min(tr2.data)))
-    axs[2].annotate('Trigger channel before(blue) vs. after(red)',xy=(xmin+(xmax-xmin)/2.0, np.min(spikeamp)))
+    axs[2].annotate('Trigger channel before(blue) vs. after(red)',xy=(xmin+(xmax-xmin)/2.0, np.min(testdata)))
     axs[0].bar(errtime, height = np.max(tr1.data), width=.02, bottom=np.min(tr1.data), align='center',color = "green",fill=False)
     axs[0].plot(streamtime,tr1.data,label = "Original trace",color='blue',linewidth = 2) # original trace in blue
     axs[0].scatter(clicktime,clickamp,color = 'blue',s=8) # original clickpoints
@@ -905,6 +907,9 @@ def main():
             elif '.' in args.lower() and i!=0: # A file name has been specified.
                 infile = args
                 filelist.append(infile)
+            elif '-display' in args.lower():
+                SAC = False
+                MSEED = False
 #        print(f"Clickfile = {Clickfile}, Wavetrack = {Wavetrack}, filename = {infile}")
 
         outfolder = ".\\"                          # Assume user has specified a local file
@@ -936,7 +941,7 @@ def main():
                     streamdata        = np.arange(len(streamamp),dtype=np.float32)
                     for n in range(len(streamamp)): #   Load the array with time-history data
                         streamdata[n] = np.float32(streamamp[n])
-                    St_time = time_params['St_time']
+                    St_time = time_params['St_time'] + float(metadata['tc'])
                     print(f"Importing Wavetrack file {infile}:")
                 if Clickfile:
                     #print("Trying to import clickfile")
@@ -946,7 +951,7 @@ def main():
                     streamdata        = np.arange(len(streamamp),dtype=np.float32) # b = time history intended for placing within the miniseed stream
                     for n in range(len(streamamp)):                                #   Load the array with time-history data
                         streamdata[n] = np.float32(streamamp[n])
-                    St_time = time_params['St_time']
+                    St_time = time_params['St_time']+ float(metadata['tc'])
                     print(f"Importing Clickfile {infile}:")
                 #
                 #                             Print status lines 
@@ -961,15 +966,17 @@ def main():
 #                print(f"St_time = {St_time.hour:02.0f}:{St_time.minute:02.0f}:{St_time.second:02.0f}.{int(St_time.microsecond/1000)}")
                 print(f"Time correction = {metadata['tc']} seconds.")
                 print(f"starttime = {time_params['starttime']}")
-                print(f"There are {len(errtime)} discontinuities in this file.\n")
-                if len(errtime):
-                    print("Repair discontinuities in Wavetrack output file, then re-run PNE2SAC.")
+                if errtime:
+                    print(f"There are {len(errtime)} discontinuities in this file.\n")
+                    if len(errtime):
+                        print("Repair discontinuities in Wavetrack output file, then re-run PNE2SAC.")
                 #
                 #              Calculate optimized trace
                 #
 #                if metadata['optimize']:
                 new_clicktime,clickamp,Clicktime_to_adjust,C2amp,testdata,spiketime,spikeamp = \
                 Optimize(clicktime,clickamp,streamtime,streamdata,metadata,time_params)
+
 #                else:
 #                    new_clicktime = clicktime
 #                    Clicktime_to_adjust = [clicktime[0],clicktime[len(clicktime)-1]]
@@ -1008,6 +1015,17 @@ def main():
                 print(f"%reduction in spike amplitude: {(1-np.max(np.abs(newtestdata))/np.max(np.abs(testdata)))*100.:02.1f} %\n")
 
                 if QCcheck: # Assuming the waveforms passed quality check, save the files
+                    #
+                    # export the click file as either optimized or original
+                    #
+                    if SAC or MSEED:
+                        if metadata['optimize']:
+                            Export_clickfile(metadata,new_clicktime,clickamp)
+                        else:
+                            Export_clickfile(metadata,clicktime,clickamp)
+                    #
+                    # Write out the SAC file
+                    #
                     if SAC:   # If user selected SAC files, write a SAC file
                         if metadata['optimize']:
                             print('Using the optimized trace to create the SAC file.')
@@ -1015,30 +1033,21 @@ def main():
                         else:
                             print('Using the original trace without optimization to create the SAC file.')
                             Create_sacstream(streamdata,metadata,time_params,outfolder)
-
-
+                    #
+                    # Write out the miniseed file
+                    #
                     if MSEED: # If user selected MSEED files, write a mseed file
                         outfile = os.path.join(outfolder,filename+".mseed")
                         if metadata['optimize']:
                             tr = tr2
-                            print(f"Using the optimized trace to create miniseed file.") #: {outfile}")
-                            
+                            print(f"Using the optimized trace to create miniseed file.")       
                         else:
                             tr = tr1 
-                            print(f"Using the original trace to create miniseed file.") # {outfile}")
+                            print(f"Using the original trace to create miniseed file.")
                         tr.write(outfile,format = "MSEED")
                         print(f"File succesfully written: {outfile}")
-#  This is test code to be removed from final version:############################
-#                        tr1.stats['location'] = '00' # Original trace
-#                        filename = metadata['network']+"."+metadata['station']+"."+tr1.stats.location+"."+metadata['component']+"."+ftime
-#                        outfile = os.path.join(outfolder,filename+".original.mseed")
-#                        tr1.write(outfile,format="MSEED")
-#                        tr2.stats['location'] = '01' # optimized trace
-#                        filename = metadata['network']+"."+metadata['station']+"."+tr2.stats.location+"."+metadata['component']+"."+ftime
-#                        outfile = os.path.join(outfolder,filename+".mseed")
-#                        tr2.write(outfile,format="MSEED")
-#   END of test code. ############################################################
-                else:
+
+                else: # Flagged QCcheck has failed so no output is generated.
                     print('Quality check failure; Check for discontinuities and re-edit the Wavetrack file.')
                     print('No SAC or miniseed files written to disk for this waveform.')        
                 plot_optimized(metadata,time_params,outfolder,tr1,tr2,errtime,streamtime,clicktime,Clicktime_to_adjust,spiketime,clickamp,spikeamp,testdata,newtestdata,C2amp)
