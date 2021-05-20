@@ -56,7 +56,7 @@ __license__ = "MIT"
 # THE SOFTWARE, EVEN IF IT HAS BEEN OR IS HEREAFTER ADVISED OF THE POSSIBILITY
 # OF SUCH DAMAGES.
 
-import os, csv, sys, numpy as np #, time, calendar, string
+import os, csv, sys, numpy as np
 from obspy.io.sac import SACTrace
 from obspy.core import read, Trace, Stream, UTCDateTime
 from obspy.signal.detrend import polynomial
@@ -74,21 +74,24 @@ class ASCconvertError(Exception):
         return repr('{0}: {1}'.format(self.error_name, self.error_text))
 
 class ASCconvert(object):
-    '''PNE2SAC is a utility for converting text files representing MSU digitized 
-       records of PNE events from the Soviet Union. 
+    '''PNE2SAC is a utility for converting text files representing seismic waveforms.
+       These text files are exported from Wavetrack. The text file is then modified by
+       adding a header containing the metadata associated with the digitization.
        
-       Useage: Activate Pythons ObsPy package, then from the command prompt
+       Useage: Activate Python's ObsPy environment, then from the command prompt
        specify the target file. 
 
-       Syntax1: python PNE2SAC.py infile_name
-       Syntax2: python PNE2SAC.py directoryname (file_extension)
-       Syntax 2 enables you to specify a whole directory to convert multiple
-       files in one go.
-
+       Syntax: python PNE2SAC.py infile_name
+       where, infile_name represents the output file from Wavetrack.
 
        Typical useage:
-       <ObsPy> C:\Python27\scripts> python PNE2SAC.py C:/../infil.txt 
-       <ObsPy> C:\Python27\scripts> python PNE2SAC.py C:/seismic/PNE 
+       <ObsPy> C:\Python27\scripts> python PNE2SAC.py C:/digitizations/station/channel/infile.txt
+
+       Other options include:
+       -display    : which opens and displays, but does not output any miniseed or SAC files
+       -clickfile  : which opens a clickfile output from a previous PNE2SAC project rather than a wavetrack file.
+
+       Consult the source code for more documentation and revision history.
 
     '''
 # version 20210519: Fix the SAC timing that was missing the time correction constant.
@@ -154,12 +157,12 @@ class ASCconvert(object):
 # Two lists are returned: SAChead, and Data
 #
 #
-# Each text file must contain a header with the following nine rows (comment and location are optional):
+# Each text file must contain a header with the following rows (some are optional):
 #
-#    COMMENT Neva-2-2-Stolb-409_600dpi
+#    COMMENT Neva-2-2-Stolb-409_600dpi (optional)
 #    NETWORK RY
 #    STATION STB
-#    COMPONENT HHZ
+#    COMPONENT EHZ
 #    LOCATION (optional). Default is "blank" but other common values are 00,01
 #    REFTIME   24_JUL_1987_02:03:00.000
 #    STARTTIME 24_JUL_1987_02:05:00.000
@@ -167,10 +170,13 @@ class ASCconvert(object):
 #    TC -1.5
 #    OPTIMIZE TRUE (optional). False is the default.
 #        You can set it TRUE if you want optimization algorithm to make changes automatically.
-#    THRESHOLD 8 (optional. 8 is the default for optimization. This can be set between 4 and around 12, 
+#    THRESHOLD 25 (optional) (25 is the default. Most practical values range from 25 through 50)
 #        where lower numbers are more aggressive with the optimization. 
 #        Optimize moves clickpoints back & forth to minimize glitches in the
-#        derivative above 8 Hz but if you are too aggressive it makes things worse. 
+#        derivative above 16 Hz but if you are too aggressive it makes things worse.
+#    BREAKPOINT 16 (optional). 16 Hz is the default and seems to work for everything.
+#    SHIFTLIMIT 0.085 (optional). This sets how many seconds the click point is allowed to move during optimization.
+#        Shiftlimit values typically range between 0.085 and 0.250 for optimizing waveforms. 
 #
 #    Headers are followed by the data fields, representing time (relative to REFTIME) and amplitude (in centimeters):
 #
@@ -189,15 +195,11 @@ class ASCconvert(object):
 #    to manually calculate it into the start time. 
 #
 #    When building the header, ensure that station code is in compliance with pre-existing ISC international station code
-#    and that the component match standard naming convention for IRIS/SEED channel names (i.e. SHZ,BHN,HHE, etc.)
+#    and that the component match standard naming convention for IRIS/SEED channel names (i.e. EHZ,HLN,EHE, etc.)
+#    Typically, a short-period sensor such as an SKM will use channel name EHZ or ELZ depending on gain
+#    Typically a longer period sensor such as an SKD (period over 10 seconds) will use HLZ,HLN,HLE
+#
 
-
-
-
-
-
-#                                   The Defs for PNE2SAC:
-# version 20201205: Include SAC header field 'lpspol' to explicitly set polarity of the channel
 
 #                                   The Defs for PNE2SAC:
 #
@@ -240,7 +242,6 @@ def Match(sampletime,clicktime): # delta is time in seconds that the sample must
                     match_index.append(clicktime.index(click))
                     #print("{0} {1:0.3f} {2:0.3f}".format(clicktime.index(click),click,clicktime[clicktime.index(click)]))
     print(f'Total number of matches: {len(match)}')
- #   print(len(sampletime))
     return(match,match_index) #returns the clickpoints that match up with samples that exceeded the trigger
 
 #
@@ -297,32 +298,23 @@ def Optimize(clicktime,clickamp,streamtime,streamdata,metadata,time_params):
     # This is a hard rule for now, but may change.
     #
     tr = Maketrace(streamdata,metadata,time_params) # makes a trace from streamdata, a time-history output from PCHIP
-    #print(tr.stats)
     tr2 = tr.copy()
     tr2.differentiate(edge_order=2)
     tr2.filter("highpass",freq = metadata['breakpoint'], corners = 2) # single-pole filter above operating frequency to find big spikes
-#    tr2.differentiate()
-
     testdata = [(sample) for sample in tr2.data] # convert it to an absolute value as we look for excursions
-
     spiketime,spikeamp = Find_spikes((testdata),streamtime,float(metadata['threshold'])) # test against a threshold
+    #
     # Match requires the spiketime match the clicktime within +- delta
     #
     # find minimum time between click points
     #
     clickminimum = find_minimum_click_interval(clicktime)
     print(f'minimum time between clicks is {clickminimum:0.3f} seconds.')
-
     Clicktime_to_adjust,Clicktime_to_adjust_index = Match(spiketime,clicktime) # find problem clickpoints that made the spikes
-
-#    print(len(Clicktime_to_adjust),len(Clicktime_to_adjust_index))
-
     new_clicktime = Adjust(Clicktime_to_adjust_index,clicktime,metadata['shiftlimit']) # Make revised clickpoints
-
     C2amp = []                   # Make an adjusted Clickpoint_to_amplitude list
     for index in Clicktime_to_adjust_index:
         C2amp.append((clickamp[index]))   
-
     # Optimize will provide the following:
     # Revised list of clicktimes, and amplitudes,
     # the filtered trace for plotting,spiketime,spikeamp,
@@ -344,10 +336,10 @@ def Import_clickfile(clickfile):
         clickamp = []
         metadata = {'comment':'','station':'','network':'','component':'','reftime':'01_JAN_1970_00:00:00.000', \
         'starttime':'01_JAN_1970_00:00:00.000','cf':float(1.0),'tc':float(0.0), 'location':'', 'samplerate':float(100.0),\
-        'nsamples':int(0),'polarity':1.0,'threshold':16.0,'breakpoint':16.0,'optimize':'False','shiftlimit':0.085}
+        'nsamples':int(0),'polarity':1.0,'threshold':25.0,'breakpoint':16.0,'optimize':'False','shiftlimit':0.085}
         for row in list:
             if len(row) > 0:          # skip blank lines
-                r = row[0].split()    # First seven rows are header and assigned to PNE[0]
+                r = row[0].split()    # Split up the un-blank lines into discrete values then check them.
                 if len(row):
                     if  row[0].lower() in metadata.keys():
                         metadata[row[0].lower()] = row[1]   
@@ -358,7 +350,7 @@ def Import_clickfile(clickfile):
                             clickamp.append(float(row[2]))
                         except:
                             print(f'Ignoring import of row{row}')
-        # Type the values for cf, tc, samplerate, and nsamples
+    # Type the values for cf, tc, samplerate, and nsamples
     metadata['breakpoint'] = float(metadata['breakpoint'])
     metadata['shiftlimit'] = float(metadata['shiftlimit'])       
     metadata['cf'] = float(metadata['cf'])
@@ -377,7 +369,7 @@ def Import_clickfile(clickfile):
 
     metadata['delta']     = (float(clicktime[len(clicktime)-1])-first_sampletime)/(metadata['nsamples'])
     print(f"delta has been set to {metadata['delta']} seconds, which is {1/metadata['delta']} Hz")
-    errtime = False
+    errtime = False # There is no error time in a mouse click file.
     return(clicktime,clickamp,errtime,metadata,Time_params)
 
 
@@ -405,7 +397,7 @@ def Export_clickfile(metadata,clicktime,clickamp):
         for i, mouseclicks in enumerate(clicktime,0):
             mouseclick_writer.writerow([i,f'{(clicktime[i]-clicktime[0]):003.003f}',clickamp[i]])
     print ("Mouseclick file successfully written: {0}".format(clickfile))
-
+    return()
 #
 # Load a wavetrack output file with header.
 # header contains the necessary metadata
@@ -417,7 +409,7 @@ def Import_Wavetrack(infile):
         PNE = []
         metadata = {'comment':'','station':'','network':'','component':'','reftime':'01_JAN_1970_00:00:00.000', \
         'starttime':'01_JAN_1970_00:00:00.000','cf':float(1.0),'tc':float(0.0), 'location':'', 'samplerate':float(100.0),\
-        'nsamples':int(0),'polarity':1.0,'threshold':16.0,'optimize':'False','breakpoint':16.0,'filename':'none',\
+        'nsamples':int(0),'polarity':1.0,'threshold':25.0,'optimize':'False','breakpoint':16.0,'filename':'none',\
         'shiftlimit':0.085,'outfolder':'C:\\'}
         for row in list:
             if len(row) > 0:          # skip blank lines
@@ -451,8 +443,6 @@ def Import_Wavetrack(infile):
     Time_params = Get_time_params(metadata,first_sampletime)
 
     #                       In New digitizations, first_sampletime is expected to be zero.
-#    print(f"\nStarttime is calculated as: {Time_params['starttime']}")
-    #
     #                       Delta is the average sample period. It is calculated from the offset time of last sample 
     #                       minus offset of first sample / total number of samples.
 
@@ -549,7 +539,7 @@ def log_error(point,x,y,error):
         print(f"Use Linear interpolation set sample time to {x:2.3f} seconds.\n")
 
 
-
+#  Here is where the following code is sourced and subsequently adapted to PNE2SAC:
 #  https://stackoverflow.com/questions/20677795/how-do-i-compute-the-intersection-point-of-two-lines
 
 def line_intercept(point):
@@ -584,7 +574,7 @@ def line_intercept(point):
 
 def WT_to_clickpoint(time,amp): # input the time and amplitude series. method describes the desired interpolation method
     # method = 0 [default] = Pchip interpolation methodology
-    # method = 1 = 
+    # method = 1 = spline but this is not yet implemented.
     # Slope = difference in amplitude across two adjacent samples divided by time difference between the time of those two samples
     slopes = []
     bslopes = []
@@ -678,10 +668,8 @@ def WT_to_clickpoint(time,amp): # input the time and amplitude series. method de
 
 def Pchip(clicktime,clickamp,nsamples): # Bring in clickpoints and output a PCHIPped time series
     # At this point, clicktime represents the time of each click point and clickamp represents amplitude of each mouse click
-   # print(f'length of clicktime = {len(clicktime)} Len clickamp = {len(clickamp)} Len slopes = {nsamples}')
     x_data = np.array(clicktime)
     y_data = np.array(clickamp)
-
     Pchip_time = np.linspace(min(x_data), max(x_data), nsamples) # From the oldest time to the youngest time, space out 'n' points, as specified in len(slopes)
     bi = interpolate.PchipInterpolator(x_data, y_data)
     Pchip_amplitude = bi(Pchip_time)
@@ -690,7 +678,6 @@ def Pchip(clicktime,clickamp,nsamples): # Bring in clickpoints and output a PCHI
 def Create_sacstream(b,metadata,time_params,outfolder):
     #                                          Create the SAC stream
     St_time = time_params['St_time']  + float(metadata['tc'])          # Shortcut for filename below
-    #
     Delta     = (1/float(metadata['samplerate']))
     Network   = metadata['network']
     Component = metadata['component']
@@ -724,12 +711,9 @@ def Create_sacstream(b,metadata,time_params,outfolder):
     t.knetwk = Network #         # Network designator
     t.kuser0 = "CM"        # Centimeters. Place the system of units into the user text field 0
     #
-
     ftime = (f"{St_time.year}.{St_time.month:02.0f}.{St_time.day:02.0f}.{St_time.hour:02.0f}.{St_time.minute:02.0f}.{St_time.second:02.0f}")
     filename = metadata['network']+"."+metadata['station']+"."+metadata['location']+"."+metadata['component']+"."+ftime
-
     outfile = os.path.join(outfolder,filename+".sac")
-
     #
     #               Write the SAC file
     #
@@ -769,7 +753,7 @@ def Maketrace(streamdata,metadata,time_params):
     return(tr)
 
 
-
+# PNEPLOT is at present, a legacy code snippet that is unused.
 def PNEplot(PNE,clicktime,clickamp,PNE_time,streamdata,errtime,metadata,time_params):
     PNEtime = []
     PNEamplitude = []
@@ -828,7 +812,6 @@ def plot_optimized(metadata,time_params,outfolder,tr1,tr2,errtime,streamtime,cli
 
     xmin = 0
     xmax = clicktime[len(clicktime)-1]
-    #print(len(clicktime),len(Clicktime_to_adjust))
     if len(Clicktime_to_adjust) > 1:
             if Clicktime_to_adjust[0] > 10:
                 xmin = Clicktime_to_adjust[0]-10
@@ -837,17 +820,25 @@ def plot_optimized(metadata,time_params,outfolder,tr1,tr2,errtime,streamtime,cli
     else:
         xmin = clicktime[0]
         xmax = clicktime[len(clicktime)-1]
-#    xmin = 200.75
-#    xmax = 241.0
+    #
+    # Set the limits for each of the three subplots
+    #
     axs[0].set_xlim([xmin,xmax])
     axs[1].set_xlim([xmin,xmax])
     axs[2].set_xlim([xmin,xmax])
-#    axs[2].set_ylim([-0.6,0.15])
-#    axs[0].xlabel("original vs optimized")
+    #
+    # Annotate the three subplots
+    #
     axs[0].annotate('Original(blue) vs optimized waveform(red)',xy=(xmin+(xmax-xmin)/2.0, np.min(tr2.data)))
     axs[1].annotate('optimized waveform (red)',xy=(xmin+(xmax-xmin)/2.0, np.min(tr2.data)))
     axs[2].annotate('Trigger channel before(blue) vs. after(red)',xy=(xmin+(xmax-xmin)/2.0, np.min(testdata)))
-    axs[0].bar(errtime, height = np.max(tr1.data), width=.02, bottom=np.min(tr1.data), align='center',color = "green",fill=False)
+    #
+    # Add an error bar onto the top plot for any discontinuities that might be present.
+    #
+    axs[0].bar(errtime, height = np.max(tr1.data), width=.04, bottom=np.min(tr1.data), align='center',color = "green",fill=False)
+    #
+    # Plot the data
+    #
     axs[0].plot(streamtime,tr1.data,label = "Original trace",color='blue',linewidth = 2) # original trace in blue
     axs[0].scatter(clicktime,clickamp,color = 'blue',s=8) # original clickpoints
     axs[0].plot(streamtime,tr2.data,color='red',label = "Modified trace",linewidth = 1) # optimized trace overlay
@@ -859,7 +850,9 @@ def plot_optimized(metadata,time_params,outfolder,tr1,tr2,errtime,streamtime,cli
     if testdata:
         axs[2].plot(streamtime,testdata,color='blue', linewidth = 2) # trigger channel
     axs[2].plot(streamtime,newtestdata,color='red',linewidth = 1)
-#    plt.text(xmin,np.min(tr1.data),errors)
+    #
+    # Add documentation to the plot
+    #
     ftime = (f"{St_time.year}.{St_time.month:02.0f}.{St_time.day:02.0f}.{St_time.hour:02.0f}.{St_time.minute:02.0f}.{St_time.second:02.0f}")
     filename = metadata['network']+"."+metadata['station']+"."+metadata['location']+"."+metadata['component']+"."+ftime
     filenametitle = (f"Digitized channel name: {os.path.join(outfolder,filename)}.mseed\n{metadata['comment']}")
@@ -870,20 +863,16 @@ def plot_optimized(metadata,time_params,outfolder,tr1,tr2,errtime,streamtime,cli
 def main():
 #                               Parse the command line switches
     optioncount = len(sys.argv)
-    Folder = False
+    Folder = False  # Treat the input as a single file unless the -folder command line switch is present.
     SAC = True      # Always make sac files in this version.
-    MSEED = True
-    QCcheck = True
-    Sps = 100
+    MSEED = True    # Always generate a miniseed file, unless -display is present as a command line switch
+    QCcheck = True  # Always perform a QCcheck and do not output files if QC fails.
+    Sps = 100       # PCHIP interpolated output will be 100 sps
     outputfile_defined = False
     filelist = []
     Wavetrack = True
     Clickfile = False
-#    metadata = {'comment':'','station':'','network':'','component':'','reftime':'01_JAN_1970_00:00:00.000', \
-#        'starttime':'01_JAN_1970_00:00:00.000','cf':float(1.0),'tc':float(0.0), 'location':'', 'samplerate':float(100.0),\
-#        'nsamples':int(0),'polarity':1.0,'threshold':8.0,'optimize':'False','shiftlimit':1.0}
-
-    dir=""
+    infolder=""
     extension = '.txt'
 
     if optioncount > 1:
@@ -900,7 +889,7 @@ def main():
             elif '-folder' in args.lower():
                 try:
                     Folder = True # This means the first instance following folder represents the folder name.
-                    dir = sys.argv[i+1]
+                    infolder = sys.argv[i+1]
                     filelist = os.listdir(sys.argv[i+1])
                 except:
                     print("Warning! No folder specified within arguments. Check syntax.")
@@ -919,7 +908,7 @@ def main():
         for n in range(len(filelist)):
             if extension in filelist[n]:
                 if len(filelist)>1:
-                    infile = dir+"/"+filelist[n]
+                    infile = infolder+"/"+filelist[n]
 
                 #if infile.find('.') > 0:
                 #    outfile = infile[:infile.find('.')]+'.sac'
@@ -1053,10 +1042,10 @@ def main():
                 plot_optimized(metadata,time_params,outfolder,tr1,tr2,errtime,streamtime,clicktime,Clicktime_to_adjust,spiketime,clickamp,spikeamp,testdata,newtestdata,C2amp)
         
     else:
-        print ("Useage: PNE2SAC infile.txt (outfile.asc)")
-        print ("Or, PNE2SAC target_directory target_extension(like .txt)")
-        print ("No infile or directory specified.")
-        print (len(sys.argv))
+        print ("Useage: PNE2SAC Wavetrack_exportfile.txt")
+        print ("Or, PNE2SAC -clickfile PNE2SAC_clickfile.csv\n")
+        print ("No input file was specified.")
+        print (f"Number of input argments: {len(sys.argv)} = {sys.argv}")
 
 #
 # Check and run the main function here:
