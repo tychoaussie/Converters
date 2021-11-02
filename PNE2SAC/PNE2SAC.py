@@ -24,7 +24,7 @@ SOFTWARE.'''
 
 
 __author__ = "Daniel Burk <burkdani@msu.edu>"
-__version__ = "20210519"
+__version__ = "20210810"
 __license__ = "MIT"
 
 # -*- coding: utf-8 -*-
@@ -94,6 +94,13 @@ class ASCconvert(object):
        Consult the source code for more documentation and revision history.
 
     '''
+# version 20210810: Add alternate interpolation methods into the code for research purposes.
+#                   New interpolation methods can be called by including additional
+#                   header value in the input file. If left out, the default is PCHIP.
+#                   Put in the header called 'interpolation' such as:
+#                   interpolation pchip ( this is the default)
+#                   interpolation cubicspline
+#                   interpolation cubichermitespline
 # version 20210519: Fix the SAC timing that was missing the time correction constant.
 # version 20210428: Revision 2.0 includes:
 #                   Waveform analysis and optimization algorithm, support of clickpoint input files
@@ -410,7 +417,7 @@ def Import_Wavetrack(infile):
         metadata = {'comment':'','station':'','network':'','component':'','reftime':'01_JAN_1970_00:00:00.000', \
         'starttime':'01_JAN_1970_00:00:00.000','cf':float(1.0),'tc':float(0.0), 'location':'', 'samplerate':float(100.0),\
         'nsamples':int(0),'polarity':1.0,'threshold':25.0,'optimize':'False','breakpoint':16.0,'filename':'none',\
-        'shiftlimit':0.085,'outfolder':'C:\\'}
+        'shiftlimit':0.085,'outfolder':'C:\\','interpolation':'pchip'}
         for row in list:
             if len(row) > 0:          # skip blank lines
                 r = row[0].split()    # First seven rows are header and assigned to PNE[0]
@@ -489,8 +496,9 @@ def Get_time_params(metadata,first_sampletime):
 #                       Use PCHIP to provide a list of click times, and interpolated waveform from those click times.
 
 def PNE2Clicktime(metadata,PNE,Time_params):
+    # version 20210810
 
-    PNEtime = []
+    PNEtime = [] # represents time track of the selected dataset starting from the selected start time
     PNEamplitude = []
     #
     #                                    Starting_sample is the index time representing the requested start time
@@ -511,10 +519,20 @@ def PNE2Clicktime(metadata,PNE,Time_params):
     PNEamp = polynomial(PNEamp, order = 1, plot = False) # polynomial linear trend remove the offset.
 
     # Get the clickpoints
+    # You need to bring out the estimated instantaneous derivative at the clickpoint as well.
+    # Call it clickdydx
+    
+    PNEclicktime,PNEclickamp,PNEdydx,errtime = WT_to_clickpoint(PNEtime,PNEamp)
+    
+    if metadata['interpolation'] == 'pchip':
+        PNE_time,PNE_amp = Pchip(PNEclicktime,PNEclickamp,len(PNEtime))
+    if metadata['interpolation'] == 'cubicspline':
+        PNE_time,PNE_amp = Cubicspline(PNEclicktime,PNEclickamp,len(PNEtime))
+    if metadata['interpolation'] == 'cubichermitespline':
+        PNE_time,PNE_amp = CubicHermiteSpline(PNEclicktime,PNEclickamp,PNEdydx,len(PNEtime))
+    if metadata['interpolation'] == 'none':
+        PNE_time,PNE_amp = nointerpolation(PNEtime,PNEamp)
 
-    PNEclicktime,PNEclickamp,errtime = WT_to_clickpoint(PNEtime,PNEamp)
-
-    PNE_time,PNE_amp = Pchip(PNEclicktime,PNEclickamp,len(PNEtime))
     #
     #               Prepare a list of UTC corrected times that correspond to the click points.
     # PNEclicktime is a list of clickpoints in UTCDateTime
@@ -542,23 +560,27 @@ def log_error(point,x,y,error):
 #  Here is where the following code is sourced and subsequently adapted to PNE2SAC:
 #  https://stackoverflow.com/questions/20677795/how-do-i-compute-the-intersection-point-of-two-lines
 
-def line_intercept(point):
+def line_intercept(point): # version 20210810
                             # Points are configured as [time(x), amplitude(y), slope(m)]
     error = 0
     point1 = point[0]
     point2 = point[1]
     b1 = (point1[1] - point1[2]*point1[0])  #b = amplitude(y) - slope(m) * time(x)
     b2 = (point2[1] - point2[2]*point2[0])  # this is b: the y intercept.
-    m1 = point1[2] #   
-    m2 = point2[2] #
+    m1 = point1[2] #  slope at point # 1 
+    m2 = point2[2] #  slope at point # 2
     if m1 == m2:
         error = -1
         interpolated_time = point1[0]+(point2[0]-point1[0])/2.0
         interpolated_amplitude = point1[1]+(point2[1]-point1[1])/2.0
         return (interpolated_time,interpolated_amplitude,error)
     x = (b2 - b1) / (m1 - m2) # Calculate the x position of the interection of the lines
-    y = m1 * x + b1
-
+    y = m1 * x + b1 # 
+  #  slope = (m1+m2)/2.0 # average slope halfway between the two points.
+    #slope = m1+((m2-m1)*(x-point1[0])/(point2[0]-point1[0]))
+    slope = m1 * (x - point1[0])/(point2[0]-point1[0]) + m2 * (point2[0] - x)/(point2[0]-point1[0])
+    # in reality, the slope should be weighted depending on the "closeness" between the two points.
+    # point1[0] is time at first point, point2[0] is time at second point, x is time of clickpoint between these two.
     # If the calculated point falls more than .002 seconds outside of the wavetrack points, assume
     # there is a discontinuity within wavetrack data and interpolate.
     
@@ -566,13 +588,15 @@ def line_intercept(point):
         error = x
         x = point1[0]+(point2[0]-point1[0])/2.0 # interpolate a midpoint
         y = point1[1]+(point2[1]-point1[1])/2.0
-    return (x,y,error) # Pass the miscalculated value for error logging.
+    #slope = 0
+    return (x,y,slope,error) # Pass the miscalculated value for error logging.
 
 
 # (PCHIP stands for Piecewise Cubic Hermite Interpolating Polynomial)
 # clues taken from here: https://stackoverflow.com/questions/31221444/intuitive-interpolation-between-unevenly-spaced-points
 
 def WT_to_clickpoint(time,amp): # input the time and amplitude series. method describes the desired interpolation method
+    # version 20210810
     # method = 0 [default] = Pchip interpolation methodology
     # method = 1 = spline but this is not yet implemented.
     # Slope = difference in amplitude across two adjacent samples divided by time difference between the time of those two samples
@@ -648,23 +672,25 @@ def WT_to_clickpoint(time,amp): # input the time and amplitude series. method de
     # At this point, we have a list of points that bracket the actual click point. 
     # Now, process this list of points to yield a list of click points and the times represented by the click point.
     # Now iterpolate each point and build a list of times and amplitudes
-   
-    clicktime = []
-    clickamp = []
+    PNEdydx = [] # Let's attempt to assemble a list of average slopes as a centimeter / second value
+    PNEclicktime = []
+    PNEclickamp = []
     errtime = []
     for point in points:
         if not point[1]:       # a second point does not exist for the first and last point within the list.
-            clicktime.append(point[0][0])
-            clickamp.append(point[0][1])
+            PNEdydx.append(point[0][2]) # The slope associated with the first or last clickpoint
+            PNEclicktime.append(point[0][0])
+            PNEclickamp.append(point[0][1])
         else:                  # find the intercept point from the points list and add it to the final list.
-            x,y,error = line_intercept(point)
-
-            clicktime.append(x)
-            clickamp.append(y)
+            x,y,slope,error = line_intercept(point)
+            PNEdydx.append(slope)
+            PNEclicktime.append(x)
+            PNEclickamp.append(y)
             if error != 0:
                 log_error(point,x,y,error) # Process the error
                 errtime.append(x) # Record whenever a linerly interpolated point exists.
-    return(clicktime,clickamp,errtime)
+
+    return(PNEclicktime,PNEclickamp,PNEdydx,errtime)
 
 def Pchip(clicktime,clickamp,nsamples): # Bring in clickpoints and output a PCHIPped time series
     # At this point, clicktime represents the time of each click point and clickamp represents amplitude of each mouse click
@@ -674,6 +700,31 @@ def Pchip(clicktime,clickamp,nsamples): # Bring in clickpoints and output a PCHI
     bi = interpolate.PchipInterpolator(x_data, y_data)
     Pchip_amplitude = bi(Pchip_time)
     return(Pchip_time,Pchip_amplitude)
+
+def Cubicspline(clicktime,clickamp,nsamples): # Bring in clickpoints and output a PCHIPped time series
+    # At this point, clicktime represents the time of each click point and clickamp represents amplitude of each mouse click
+    x_data = np.array(clicktime)
+    y_data = np.array(clickamp)
+    Pchip_time = np.linspace(min(x_data), max(x_data), nsamples) # From the oldest time to the youngest time, space out 'n' points, as specified in len(slopes)
+    bi = interpolate.PchipInterpolator(x_data, y_data)
+    bi = interpolate.CubicSpline(x_data, y_data)
+    Pchip_amplitude = bi(Pchip_time) # This is the time axis onto which the interpolated points are mapped. Returns the amplitudes on this axis
+    return(Pchip_time,Pchip_amplitude)
+
+def CubicHermiteSpline(clicktime,clickamp,clickdydx,nsamples):
+    # At this point, clicktime represents the time of each click point and clickamp represents amplitude of each mouse click
+    x_data = np.array(clicktime)
+    y_data = np.array(clickamp)
+    dydx = np.array(clickdydx)
+    Pchip_time = np.linspace(min(x_data), max(x_data), nsamples) # From the oldest time to the youngest time, space out 'n' points, as specified in len(slopes)
+    # Before we can use this, we must generate an array of matching derivatives (dydx) for each click point
+    bi = interpolate.CubicHermiteSpline(x_data, y_data, dydx)
+    Pchip_amplitude = bi(Pchip_time) # This is the time axis onto which the interpolated points are mapped. Returns the amplitudes on this axis
+    return(Pchip_time,Pchip_amplitude)
+
+def nointerpolation(time,amp):
+    # Create a stream of linearly interpolated points straight from the original wavetrack output file.
+    return(time,amp)
 
 def Create_sacstream(b,metadata,time_params,outfolder):
     #                                          Create the SAC stream
@@ -784,7 +835,20 @@ def PNEplot(PNE,clicktime,clickamp,PNE_time,streamdata,errtime,metadata,time_par
 # It also calculates some statistics about the streams.
 
 
-def plot_optimized(metadata,time_params,outfolder,tr1,tr2,errtime,streamtime,clicktime,Clicktime_to_adjust,spiketime,clickamp,spikeamp,testdata,newtestdata,C2amp):
+def plot_optimized(metadata,time_params,outfolder,PNE,tr1,tr2,errtime,streamtime,clicktime,Clicktime_to_adjust,spiketime,clickamp,spikeamp,testdata,newtestdata,C2amp):
+    PNEtime = []
+    PNEamplitude = []
+    offset = False
+
+    for data in PNE:
+        if float(data[0]) >= (time_params['Starting_sample']):  # Starting_sample:  # Discard the unwanted samples from beginning of file 
+            if not offset:
+            #    print(f'Setting offset to {offset}')
+                offset = float(data[1])
+                print(f'Setting offset to {offset} while data[1] = {data[1]}')
+            PNEtime.append(float(data[0])) # This is the relative time
+            PNEamplitude.append(-1*(float(data[1])-offset)) # This is amplitude in centimeters
+
     St_time = time_params['St_time']
     tr4 = tr2.copy()
     tr4.differentiate(edge_order=2)
@@ -829,13 +893,18 @@ def plot_optimized(metadata,time_params,outfolder,tr1,tr2,errtime,streamtime,cli
     #
     # Annotate the three subplots
     #
-    axs[0].annotate('Original(blue) vs optimized waveform(red)',xy=(xmin+(xmax-xmin)/2.0, np.min(tr2.data)))
+    axs[0].annotate('Wavetrack points (black), Original PCHIP(blue), optimized waveform(red). Discontinuities in green.',xy=(xmin+(xmax-xmin)/4.0, np.min(tr2.data)))
     axs[1].annotate('optimized waveform (red)',xy=(xmin+(xmax-xmin)/2.0, np.min(tr2.data)))
     axs[2].annotate('Trigger channel before(blue) vs. after(red)',xy=(xmin+(xmax-xmin)/2.0, np.min(testdata)))
     #
     # Add an error bar onto the top plot for any discontinuities that might be present.
     #
-    axs[0].bar(errtime, height = np.max(tr1.data), width=.04, bottom=np.min(tr1.data), align='center',color = "green",fill=False)
+    axs[0].bar(errtime, height = np.max(tr1.data)-np.min(tr1.data), width=.02, bottom=np.min(tr1.data), align='center',color = "green",fill=True)
+    #
+    # Plot the original PNE stream of interpolated points, if they exist.
+    #
+    if(len(PNEtime)):
+        axs[0].scatter(PNEtime,PNEamplitude,color='black',s=2)
     #
     # Plot the data
     #
@@ -1039,7 +1108,7 @@ def main():
                 else: # Flagged QCcheck has failed so no output is generated.
                     print('Quality check failure; Check for discontinuities and re-edit the Wavetrack file.')
                     print('No SAC or miniseed files written to disk for this waveform.')        
-                plot_optimized(metadata,time_params,outfolder,tr1,tr2,errtime,streamtime,clicktime,Clicktime_to_adjust,spiketime,clickamp,spikeamp,testdata,newtestdata,C2amp)
+                plot_optimized(metadata,time_params,outfolder,PNE,tr1,tr2,errtime,streamtime,clicktime,Clicktime_to_adjust,spiketime,clickamp,spikeamp,testdata,newtestdata,C2amp)
         
     else:
         print ("Useage: PNE2SAC Wavetrack_exportfile.txt")
