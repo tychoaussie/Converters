@@ -24,7 +24,7 @@ SOFTWARE.'''
 
 
 __author__ = "Daniel Burk <burkdani@msu.edu>"
-__version__ = "20210810"
+__version__ = "20250408"
 __license__ = "MIT"
 
 # -*- coding: utf-8 -*-
@@ -56,12 +56,14 @@ __license__ = "MIT"
 # THE SOFTWARE, EVEN IF IT HAS BEEN OR IS HEREAFTER ADVISED OF THE POSSIBILITY
 # OF SUCH DAMAGES.
 
-import os, csv, sys, numpy as np
+import argparse, time
+import os, csv, sys, math, numpy as np
 from obspy.io.sac import SACTrace
 from obspy.core import read, Trace, Stream, UTCDateTime
 from obspy.signal.detrend import polynomial
 import matplotlib.pyplot as plt
 from scipy import interpolate
+
 
 class ASCconvertError(Exception):
 
@@ -72,28 +74,23 @@ class ASCconvertError(Exception):
 
     def __str__(self):
         return repr('{0}: {1}'.format(self.error_name, self.error_text))
-
-class ASCconvert(object):
-    '''PNE2SAC is a utility for converting text files representing seismic waveforms.
-       These text files are exported from Wavetrack. The text file is then modified by
-       adding a header containing the metadata associated with the digitization.
-       
-       Useage: Activate Python's ObsPy environment, then from the command prompt
-       specify the target file. 
-
-       Syntax: python PNE2SAC.py infile_name
-       where, infile_name represents the output file from Wavetrack.
-
-       Typical useage:
-       <ObsPy> C:\Python27\scripts> python PNE2SAC.py C:/digitizations/station/channel/infile.txt
-
-       Other options include:
-       -display    : which opens and displays, but does not output any miniseed or SAC files
-       -clickfile  : which opens a clickfile output from a previous PNE2SAC project rather than a wavetrack file.
-
-       Consult the source code for more documentation and revision history.
-
-    '''
+        
+# Version 20250408: Correct SAC file outout to correctly calculate and apply the sample rate rather than use the default 100 sps, which is not always the case.
+# Version 20250218: discontinuity error threshold in line_intercept() raised from .002 seconds to .010 seconds, corresponding to one sample at 100 samples/second.
+#                 : Also change the threshold of WT_to_Clickpoint from 2 to 16 and save it in variable called dither_ratio to accomodate SKD instruments with long periods and low slope changes
+# Version 20250113: Continued fillgaps() development. Address boundary conditions at first/last clickpoint of file if it lands on the minute mark. 
+#                   Set velocity to zero on 1st and last clickpoint by setting it to the mean of the gap.
+# version 20250110: output files are no longer created when there are discontinuities in the wavetrack export file. 
+#                   PNE2SAC version number is output when code is started for tracking purposes.
+#                   A new command line parsing method (argparse) has been added for more standardized program execution
+#                   New options added to code including:
+#                   -logfile for outputting the text to a log file without needing a pipe.
+#                   -New fillgaps() improvements
+#                   - Cleanup and enhanced documentation within the code
+# version 20250107: Continued improvement of fillgaps plus integration of controls for automatic operation of code with python scripts from Jupyter notebook
+#                   such as the -Nograph option. Use with Jupyer Notebook: "20250102_Parse_KAZAKH_PNE_folder_for_fillgaps_rebuild" for batch converting whole libraries
+#                   from microsoft TEAMS containing digitalization libraries
+# version 20240820: Add the optional fillgaps() to code for correcting timing marks
 # version 20210810: Add alternate interpolation methods into the code for research purposes.
 #                   New interpolation methods can be called by including additional
 #                   header value in the input file. If left out, the default is PCHIP.
@@ -171,17 +168,19 @@ class ASCconvert(object):
 #    STATION STB
 #    COMPONENT EHZ
 #    LOCATION (optional). Default is "blank" but other common values are 00,01
+#    POLARITY (optional). Default is 1.0. Positive is left-going swings in the signal on wavetrack. Set to -1.0 if you suspect the positive-going wave faces to the right on the wavetrack image.
 #    REFTIME   24_JUL_1987_02:03:00.000
 #    STARTTIME 24_JUL_1987_02:05:00.000
 #    CF 25000
 #    TC -1.5
+#    FILLGAPS TRUE (optional). False is the default. Set true if you want to fill the timing gaps with synthetic waveform. 
 #    OPTIMIZE TRUE (optional). False is the default.
 #        You can set it TRUE if you want optimization algorithm to make changes automatically.
 #    THRESHOLD 25 (optional) (25 is the default. Most practical values range from 25 through 50)
 #        where lower numbers are more aggressive with the optimization. 
 #        Optimize moves clickpoints back & forth to minimize glitches in the
 #        derivative above 16 Hz but if you are too aggressive it makes things worse.
-#    BREAKPOINT 16 (optional). 16 Hz is the default and seems to work for everything.
+#    BREAKPOINT 16 (optional). highpass filter corner frequency for derivative. 16 Hz is the default and seems to work for everything.
 #    SHIFTLIMIT 0.085 (optional). This sets how many seconds the click point is allowed to move during optimization.
 #        Shiftlimit values typically range between 0.085 and 0.250 for optimizing waveforms. 
 #
@@ -204,21 +203,64 @@ class ASCconvert(object):
 #    When building the header, ensure that station code is in compliance with pre-existing ISC international station code
 #    and that the component match standard naming convention for IRIS/SEED channel names (i.e. EHZ,HLN,EHE, etc.)
 #    Typically, a short-period sensor such as an SKM will use channel name EHZ or ELZ depending on gain
+#    Use ELZ for gains less than about 1800. Use EHZ for gains higher than that.
+#    Use the location code designator to separate out the mid-gain, normal gain, and high gain channels. 
+#    Make it blank for normal gain short period channels, like channels from around 20000 to 50000
+#    Set location code to 01 for mid-gain channels from 1800 through about 15000
+#    Set location code to 02 for the high gain channels from 50000 to 100000+
+#    This will depend on what you have for the station for that particular epoch. Some stations used multiple gains, some not.
+#
 #    Typically a longer period sensor such as an SKD (period over 10 seconds) will use HLZ,HLN,HLE
 #
 
 
 #                                   The Defs for PNE2SAC:
 #
+
+#
+# New argument parser (08JAN2025) for program execution that looks more standard than my old hand-written code
+#
+
+parser=argparse.ArgumentParser(
+    description=
+    '''PNE2SAC is a utility for converting text files representing seismic waveforms.\n
+       These text files are exported from Wavetrack. The text file is then modified by
+       adding a header containing the metadata associated with the digitization.\n\n  
+       Useage: Activate Python's ObsPy environment, then from the command prompt
+       specify the target file.\n\n 
+       Syntax: python PNE2SAC.py infile_name
+       where, infile_name represents the output file from Wavetrack.\n\n
+       Typical useage:\n
+       <ObsPy> C:\\Python27\\scripts> python PNE2SAC.py C:/digitizations/station/channel/infile.txt\n\n
+       Other options include:\n
+       -display    : which opens and displays, but does not output any miniseed or SAC files\n
+       -clickfile  : which opens a clickfile output from a previous PNE2SAC project rather than a wavetrack file.\n\n
+       Consult the source code for more documentation on necessary header fields for the wavetrack output file and revision history.''',
+    epilog="""Daniel Burk, Michigan State University mailto:burkdani@msu.edu""")
+parser.add_argument('filename', help='PNE2SAC requires at minimum, the filename of the wavetrack output file with header added.')
+parser.add_argument('-clickfile', action = 'store_true', help='Use a previously generated clickfile as the input file.')
+parser.add_argument('-folder', action = 'store_true', help='input folder for conversion of multiple wavetrack output files at a time from the same folder')
+parser.add_argument('-nograph',  action = 'store_true', help='Suppress graphical output to terminal and route text to log file.')
+parser.add_argument('-logfile',  action = 'store_true', help='Route screen text to a log file in the destination folder.')
+parser.add_argument('-optimize', action = 'store_true', help='Fine-tune clickpoint timing to minimize glitches in the derivative of the resulting signal.')
+parser.add_argument('-fillgaps', action = 'store_true', help='Find 1-second timing gaps in data and fill them with synthetic signal to smooth for signal processing')
+parser.add_argument('-display', action = 'store_true', help='Suppress file generation and only create the display graphic for viewing.')
+parser.add_argument('-sps', type=float,default=100.0, help='Set an optional sample rate other than the default 100 samples/second on miniseed/sac output files')
+
+
+
 def str2bool(v):                         # Return a boolean value if text is found that matches the list
   return v.lower() in ("yes", "y", "true", "t", "1")
 
-# FIND_SPIKES: Find locations in the data where input is the list of data from the 1-pole 8hz filter stream, 
+# FIND_SPIKES: (used by Optimize) Find locations in the data where input is the list of data from the 1-pole 8hz filter stream, 
 # corresponding PNE_time in seconds since first sample, and the threshold vale
 # Output is the sample time of the spike in seconds since first sample, and it's corresponding value
-#
+# Discount clickpoints that are too small in terms of amplitude deviation to make a difference.
+# Do this by comparing the difference in amplitude to the max/min of the 10 previous and 10 proceeding clickpoints
+# If the difference in amplitude is less than 1/4 of the maxmin, don't tag it as a spike.
+# 
 def Find_spikes(data,PNE_time,threshold):
-    absdata = np.abs(data)
+    absdata = np.abs(data) # Create the absolute value of the data stream, which is a list of amplitudes 
     samplenumber = []
     value = threshold*np.mean(absdata)   # Trigger when value exceeds n times the mean
     for i,sample in enumerate(absdata):
@@ -233,6 +275,7 @@ def Find_spikes(data,PNE_time,threshold):
         amplitude.append(data[sample])
     return(sampletime,amplitude) # representing the points where threshold was exceeded
 #
+# def Match: (Used by Optimize)
 # Input is the spike's sample time in seconds since the first sample, and the list of clickpoint times.
 # Output is the matched clickpoint in seconds since first sample, and the index number of said clickpoint in the list.
 #
@@ -248,10 +291,11 @@ def Match(sampletime,clicktime): # delta is time in seconds that the sample must
                     match.append(click)
                     match_index.append(clicktime.index(click))
                     #print("{0} {1:0.3f} {2:0.3f}".format(clicktime.index(click),click,clicktime[clicktime.index(click)]))
-    print(f'Total number of matches: {len(match)}')
+    print(f'Total number of matches: {len(match)} out of {len(sampletime)}clickpoints exceed the trigger threshold specified.')
     return(match,match_index) #returns the clickpoints that match up with samples that exceeded the trigger
 
 #
+#  def find_minimum_clickpoints(Used by Optimize() and Adjust())
 #  Find the minimum interval within a clickfile series, that represents probably a single pixel of resolution.
 #
 
@@ -262,10 +306,13 @@ def find_minimum_click_interval(clicktime):
         if interval < clickminimum:
             clickminimum = interval
     return(clickminimum)
+
 #
+# Def Adjust, used by optimize():
 # Input is the clickpoint list, along with the index number of the selected clickpoint in need of adjustment.
 # Output is the refined clickpoint list.
 #
+
 def Adjust(match_index,clicktime,shiftlimit):
     # Adjust the clicktimes associated with the glitch to reduce the excessive velocities
     clickminimum = find_minimum_click_interval(clicktime)  # Estimated Time interval for one pixel 
@@ -280,8 +327,10 @@ def Adjust(match_index,clicktime,shiftlimit):
                 if shiftlimit < clickminimum: # Dont let the shiftlimit fall below the one-pixel threshold
                     shiftlimit = clickminimum 
                 maxshift = shiftlimit # *clickminimum # max time in seconds allowed in a given clickpoint adjustment
-                # Preserve polarity
-                polarity = ((post+pre)/2.0)/np.abs((post+pre)/2.0)
+                # Preserve polarity but watch out for when post+pre = 0
+                polarity = 1
+                if post+pre != 0: # Divide by the ABS of itself to capture polarity as being either 1.0 or -1.0 
+                    polarity = ((post+pre)/2.0)/np.abs((post+pre)/2.0)
 
                 if np.abs((post+pre)/2.0) < maxshift:
                     shift = (post+pre)/2.0
@@ -294,21 +343,386 @@ def Adjust(match_index,clicktime,shiftlimit):
                 print(f"Last clickpoint, although tagged for adjustment, has not been modified.")
     return(clicktime) # return a modified set of click points
 
+
+# Used by fillgaps(): 
+# generate_points : This is one of the frogDNA generating engines (10-16-2024).
+# Note that the inflection points that bracket the timing mark do not represent true inflectin points, but instead represent where the timing gap
+# begins and ends. Thus they must be dealt with as they introduce artifacts into the signal when removing instrumetn response.
+# First synthesized clickpoint falls on the same line as incoming clickpoint to eliminate it's erroneous inflection point.
+# Last synthesized clickpoint falls on the same line as the outgoing bracketing clickpoint as it also does not represent an inflection point
+# Outputs from the def are a list of clickpoints, with synthesized time and amplitude for filling in the gap.
+
+
+#  def generate_points3: Used by fillgaps(): 
+#  This is the frogDNA generating engine.
+#
+# For scenarios in fillgaps, where the synthesized points are based on the starting and ending direction of the point amplitudes on initial velocities. 
+# Four scenarios possible: (-V1 & -V2), (+V1 & +V2), (+V1 & -V2), (-V1 & +V2)
+# Inputs to the def are:
+    # generate_points inputs:
+    # T1 = time of beginning point 
+    # A1 = Amplitude of beginning point
+    # V1 = Velocity at beginnign point
+    # T2 = Time of endin point
+    # A2 = Amplitude at ending point
+    # V2 = Velocity at ending point
+    # Numpoints = rate of points per second
+    # tmed: median time gap
+    # tmin: minimum time gap
+    # Alow: lowest amplitude from adjacent clickpoints
+    # Ahigh: highest amplitude from adjacent clickpoints
+    # Outputs from the def are a list of clickpoints, with synthesized time and amplitude for filling in the gap.
+
+        # generate_points3 = Build four clickpoints, with amplitudes that move from segments[2] to segments[4], but
+        #                    with amplitudes of 75% peak from cpmax to cpmin.
+        #                    Clockpoint[0] occurs at T1+(T2-T1/6) * 1 with amplitude: ((T2-T1)/6)* (i+1)
+        #                    Clickpoint[1] occurs at T1+(T2-T1/6) * 2 with amplitude: (cpmax-cpmin)/2+(segments[3]-segments[2]/6) * 2
+        #                    Clickpoint[2] occurs at T1+(T2-T1/6) * 3 with amplitude: -(cpmax-cpmin)/2+(segments[3]-segments[2]/6) * 3
+        #                    Clickpoint[3] occurs at T1+(T2-T1/6) * 4 with amplitude: (cpmax-cpmin)/2+(segments[3]-segments[2]/6) * 4
+        #                    Clickpoint[4] occurs at T1+(T2-T1/6) * 5 with amplitude: -(segments[3]-segments[2]/6)* 5
+        # generate_points builds four clickpoints that are aware of the mean in the signal and add it to a pseudo-random signal.
+        # Still some issues with conditions, where the initial & final amplitude going into the gap seem to have an effect.
+        # Thus , point amplitudes need to be chosen to negate the apparent mean change over the timing gap such that it arrives
+        # at zero displacement over the gap length.
+        # Pass to the def the following : 
+        # A1/V1/T1: Clickpoint & it's instantaneous velocity going into the gap
+        # A2/V2/T2: Clickpoint & it's instantaneous velocity coming out of the gap
+        # Numpoints
+        # Tmed/Tmin/Alow/Ahigh/Amean = Stats about the clickpoints surrounding the gap such as variation in clickpoint density, and variation of the amplitudes.
+        # One variable we might need is the mean on either side of the gap, for we want a "zero" total displacement across the gap (Amean).
+        # It is expected however, that ultimate success cannot be achieved unless the code be made aware of the amplitude/phase curve of the channel and that
+        # cannot be applied at the clickpoint level.
+        # Original alrorithm: Polarities for the clickpoints relative to the incoming and outgoing velocity slopes:
+        # amps = [1,-1,0,-1,1] # based on five points within the timing gap. 
+        # if ((V1 < 0) and (V2 < 0)): # - - starting velocity negative, ending velocity negative
+        # amps = [-1,1,0,-1,1]
+        # if ((V1 < 0) and (V2 > 0)):    # - + 
+        # amps = [-1,1,0,1,-1]
+        # if ((V1 > 0) and (V2 > 0)):   # + + 
+        # amps = [1,-1,0,1,-1]
+        # if ((V1 > 0) and (V2 < 0)):  # + -
+        # amps = [1, -1,0,-1, 1]     
+        # Check Amean, it seems to be calculating incorrectly. -drb 1/7/2025
+        
+def generate_points3(T1, A1, V1, T2, A2, V2, Numpoints, Tmed, Tmin, Alow, Ahigh,Amean, cpmean):
+    points = []
+    # T1 represents beginning time of segment
+     # Calculate total time gap representing the length of time that needs to be filled for this segment
+    Tgap = T2 - T1
+    # Scenarios determine the starting and ending direction of the point amplitudes depending on intial velocities 
+#
+#
+#  Make the amps multipliers velocity-aware. There are however, some glitches at the beginning and ending of the generated miniseed files files. 
+#
+#    amps = [-1*V1/np.abs(V1),1*V1/np.abs(V1),-1*V2/np.abs(V2),1*V2/np.abs(V2)] # Set velocity direction based on bracketing clickpoints
+    amps = [-1*V1/np.abs(V1),1*V1/np.abs(V1),0,1*V2/np.abs(V2),-1*V2/np.abs(V2)] # Set velocity direction based on bracketing clickpoints
+#    amps = [0,-1*V1/np.abs(V1),0,-1*V2/np.abs(V2),0] # Set velocity direction based on bracketing clickpoints starting at velocity zero?
+    print(f'beginning velocity: {V1} : {amps} : Ending velocity: {V2}')
+    
+    npoints = 5  # This defines how many points are created.
+    clickpoint_time = []
+    clickpoint_amplitude = []
+    for i in range (0,npoints): # Fix the length to four points for now
+        clickpoint_time.append( T1 + (i+1)*(Tgap/(npoints+1))) # Time1 + 1/6th of the timing gap, up to 5/6th of the way to T2
+        #
+        # The Offset needs to be derived as a function of time, between the mean of the samples BEFORE the gap to the mean of the samples AFTER the gap.
+        #
+        
+
+        offset =  (A1+((A2-A1))/((npoints+1)/(i+1))) # Break the amplitude into five intervals that begin at A1 + 1/6th difference and end at A2 - 1/6th the difference 
+        print(f'A1:{A1} A2:{A2} offset:{offset} for point {i}')
+        #clickpoint_amp = amps[i]*(np.random.uniform(Ahigh/2, Ahigh))
+#        clickpoint_amp = amps[i]*(np.random.uniform(0, Ahigh))
+#        clickpoint_amp = (amps[i]*np.abs(np.random.uniform(Alow, Ahigh)) - Amean) # - offset)
+        clickpoint_amp = (amps[i]*np.abs(np.random.uniform(-cpmean, cpmean))) #  - Amean + offset)
+#        clickpoint_amp = (amps[i]*(np.random.uniform(Alow, Ahigh)) - Amean) # - offset)
+#        clickpoint_amp = (Amean+offset + amps[i]*(np.random.uniform(0, Ahigh)))
+#        clickpoint_amp = (Amean+offset + amps[i]*np.abs(Ahigh))
+#        print(f'clickpoint_amp: {clickpoint_amp} - Amean: {Amean} + Offset: {offset}  = {clickpoint_amp - Amean + offset}')
+#        clickpoint_amplitude.append((clickpoint_amp - Amean + offset)) 
+#        clickpoint_amplitude.append(Amean+offset + clickpoint_amp)
+        print(f'clickpoint_amp: {clickpoint_amp} + Offset: {offset}  = {clickpoint_amp + offset} and Amean = {Amean}')   
+        clickpoint_amplitude.append(clickpoint_amp + offset)
+        #clickpoint_amplitude.append(offset + amps[i]*np.abs(np.random.uniform(Ahigh/2, Ahigh)))
+
+    # Adjust A by shifting it so mean is zero
+    
+    points = []
+    for i in range(0,len(clickpoint_time)):
+        points.append((clickpoint_time[i],clickpoint_amplitude[i] )) # - np.mean(clickpoint_amplitude))) # This is the mean of the gap.
+    print(f'Ahigh: {Ahigh} cm Alow: {Alow}cm Amean: {Amean}cm Mean of clickpoint gap: {np.mean(clickpoint_amplitude)} cm')
+    return points
+
+#
+# def find_segments (Used by fillgaps()):
+# Findsegments finds and reports where there are missing segments of clickpoints representing the time gaps at the top of the minute.
+#
+
+def find_segments(clicktime,clickamp,PNEdydx):
+    #
+    # Isolate and report the missing data segments.
+    # Notice that it will sometimes grab "extra" stuff that might or might not be the time mark
+    # Parse out only segments that land on a minute mark.
+    # Note that PNEdydx (instantaneous velocity) is not accurate for this applicaiton,
+    # and a new velocity must be calculated from the points before and after the bracketing clickpoints
+    #    segments:
+    #    [0] segmentclicktime
+    #    [1] segmentinterval 
+    #    [2] segment starting clickpoint amplitude
+    #    [3] velocity leading into the segment
+    #    [4] segment ending clickpoint amplitude
+    #    [5] velocity exiting the segment
+
+    Clickinterval = [0]
+    segment = []
+    for i in range(1,len(clicktime)):
+        interval = clicktime[i]-clicktime[i-1] # Clicktime time gaps 
+        Clickinterval.append(interval)
+        # Only take gaps larger than (slightly less than) 1 second that land on an even 60-second interval 
+        # Cut it off at 2.5 seconds as anything longer is likely a signal dropout or an undigitizable section of the waveform.
+        # These bracketing clickpoints fo NOT represent inflection points but points where the trace disappears from view.
+        # i represents the index for the ending clickpoint of the segment
+        # If trapped, report back i-1 as the index for the beginnign of the segment
+        # Calculate the matching velocity of the clickpoint. 
+        # For velocity through clickpoint[i-1], use (clickamp[i-1] - clickamp[i-2]]) / (clicktime[i-1] - clicktime[i-2])
+        # For velocity through clickpoint[i], use (clickamp[i+1]-clickamp[i])/(clicktime[i+1] - clicktime[i]) 
+        #
+        #                       Valid segment falls on a period of 60 seconds from beginning of waveform, +- 0.25 seconds.
+        if (interval) > 0.92 and (interval) < 2.5 and (int(round(clicktime[i-1],0)/60) == round(clicktime[i-1],0)/60) :  # Some intervals are slightly less than one second.
+            segment.append([clicktime[i-1],interval,clickamp[i-1],\
+           (clickamp[i-1] - clickamp[i-2]) / (clicktime[i-1] - clicktime[i-2]),\
+            clickamp[i],(clickamp[i+1]-clickamp[i])/(clicktime[i+1] - clicktime[i]),i-1])        
+    return(Clickinterval,segment)
+
+#
+# def fillgaps (used by main() and PNE2Clicktime())
+#  Find and fill timing mark gaps with a synthesized data segment that looks like neutral data and miminizes artifacts 
+# when applying filters and instrument correction to the digitalized signal
+#
+
+def fillgaps(clicktime,clickamp,PNEdydx,metadata):
+    #
+    #
+    # If metadata['fillgaps']: Adjust the clickpoint stream to isolate timing gap segments, then correct by generating synthetic clickpoints.    
+    #
+    #
+#
+# Analyze the click points and assemble a list of segments where interval exceeds 1 second, and occurs at the top of the minute.
+#
+# Inputs include:
+# clicktime: A list of click points and their time relative to REFtime
+# clickamp: The digitized amplitude of the clickpoint in centimeters
+# metadata: A list of common variables related to the signal and program processing options.
+# PNEdydx : A list of the instantaneuous velocities of each clickpoint in centimeters / second
+#
+    print(f"The fillgaps def is being executed.")
+    Clickinterval,segments = find_segments(clicktime,clickamp,PNEdydx)
+    print(f"The number of segments identified for this waveform is {len(segments)}.")
+
+#    segment[0] = segmentclicktime
+#    segment[1]segmentinterval 
+#    segment[2]clickamp segment starting clickpoint amplitude
+#    segment[3] PNEdydx velocity leading into the segment
+#    segment[4] clickamp segment ending clickpoint amplitude
+#    segment[5] PNEdydx velocity exiting the segment
+#    segment [6] index i of this segment 
+
+    segmenttime = []
+    segmentvalue = []
+    segmentindex = []
+    for segment in segments:
+        segmenttime.append(segment[0]) # clicktime (seconds elapsed after the first second of REFtime)
+        segmentvalue.append(segment[1])# timing gap length in seconds
+        segmentindex.append(segment[6]) # segment index
+        print(f"At ({segment[6]}:{segment[0]:0.2f} seconds) missing {segment[1]:0.3f} sec data:")
+        print(f"    Starting amplitude for this segment: {segment[2]:0.3f} cm  Ending amplitude:{segment[4]:0.3f} cm" )    
+        print(f"    Starting velocity for this segment: {segment[3]:0.3f} cm/sec  Ending velocity:{segment[5]:0.3f} cm/sec \n\n" )
+        # Calculate the time of projected beginning and ending inflection point, based on an average amplitude for the past
+        # ten clickpoints. segment[4] is the start velocity, segment[6] is ending velocity. segment[7] is index for beginning
+        # clickpoint and segment[7]+1 is ending clickpoint
+        # 
+    # This brackets the timing gap by several seconds and returns the max, min, and peak-peak for the sections 
+    # immediately before and after the timing gap.
+    # On average, there are "n" clickpoints per second in the waveform.
+    # Number of clickpoints needed to synthesize the timing gap should be rounded up to the next integer.
+    # Try doubling this number.
+    # Try using the np.max clickpoints per second.
+
+    for i in range(0,len(segmentindex)):
+        print(segmentindex[i],segmenttime[i],segmentvalue[i])
+    print("\n\n")
+    #
+    #  Build the synthesized clickpoints for each segment by generating a grouping of random points with amplitudes within the bounds of adjacent clickpoints.
+    #
+    frogdna = []
+    for i in range(0,len(segmentindex)):
+        offset = -5   # Set an arbitrary number of clickpoints before the gap to fifteen clickpoints.
+        theend = 2*np.abs(offset)
+        if segmentindex[i] < 5:
+            offset = 0
+        if len(clicktime) - segmentindex[i] < theend: # set the end of the set to what's left
+            theend = (len(clicktime) - segmentindex[i])
+        clicktimedifference = []
+        for j in range(segmentindex[i]+offset,segmentindex[i]+offset+theend): # Go to ten clickpoints past the gap
+            clicktimedifference.append(clicktime[j+1] - clicktime[j])
+            print(f"{j}: {clicktime[j]} sec. {clickamp[j]} cm.")
+        # Print the max and min amplitude values for this (currently 20) clickpoint series
+        print(f'For segment at {segmenttime[i]} seconds, with a timing gap of {segmentvalue[i]} in length:')
+        print(f'Clicktime min = {np.min(clicktimedifference)} Ave = {np.mean(clicktimedifference)} median = {np.median(clicktimedifference)} std = {np.std(clicktimedifference)} max = {np.max(clicktimedifference)}')
+        #print (f'Max amplitude: {np.max(clickamp[(segmentindex[i]+offset):(segmentindex[i]+offset+theend)])} Min amplitude: {np.min(clickamp[(segmentindex[i]+offset):(segmentindex[i]+offset+theend)])}')
+        print (f'Peak-peak: {np.max(clickamp[(segmentindex[i]+offset):(segmentindex[i]+offset+theend)]) - np.min(clickamp[(segmentindex[i]+offset):(segmentindex[i]+offset+theend)])}')
+        print (f'Mean amplitude: {np.mean(clickamp[(segmentindex[i]+offset):(segmentindex[i]+offset+theend)])}') # Pass this to the generate_clickpoint3
+        #
+        # Calculate the rate of clickpoints/second for the 20 samples surrounding the timing gap
+        # For experimentation, try doubling the number of clickpoints to see how it affects the displacement
+        # and velocity waveforms.
+        #
+        
+        rate = 1/np.min(clicktimedifference) 
+
+        numpoints =  math.floor(rate * segmentvalue[i])+1 # number of points for the timing gap
+        # calculate maximum number of points necessary to fill the gap
+        # Then double it for increasing frequency content
+        # Then calculate the time interval represented by each point.
+        # To synthesize the signal, let each point land on the top of a half-sin lobe.
+        # If one point, time of a period should be twice the signal gap length.
+        # If two points, period = signal gap length + a period of 2x signal gap length
+        # If three points, 1/3gap + 1xgap + 2xgap 
+        #print(theend,(clicktime[segmentindex[i]+offset+theend]-clicktime[segmentindex[i]+offset]-1))
+        #print(f'Average clickpoints per second for this segment: {rate} points/second. \n Create {numpoints} clickpoints/second for this segment.')
+        #print(f'Number of seconds between each synthesized clickpoint = {segmentvalue[i]/(numpoints+1)}')
+        clickpoint_synthetic = []
+    #
+    #  Build clickpoints for the segments using a random amplitude value 
+    #
+        # cpmin, cpmax, when there is a slope in the near-DC displacment can result in overly large representitive signals when the signal level is small.
+        # Need to apply a linear regression to the sample clickpoints in order to calculate the peak-to-peak for the window.
+        # 
+        # Send as cpmin, the mean - (peak/peak / 2) and for cpmax, the mean + peak/peak/2 which represent signals immediately above and below the mean
+        # Build a list of peak-to-peaks:
+    
+    #    cpmin = np.min(clickamp[(segmentindex[i]+offset):(segmentindex[i]+offset+theend)]) # Alow : overshoot a little bit
+    #    cpmax = np.max(clickamp[(segmentindex[i]+offset):(segmentindex[i]+offset+theend)]) # Ahigh: overshoot a little bit
+    #    cpeak2peak = np.max(clickamp[(segmentindex[i]+offset):(segmentindex[i]+offset+theend)]) - np.min(clickamp[(segmentindex[i]+offset):(segmentindex[i]+offset+theend)])
+        Amean = np.mean(clickamp[(segmentindex[i]+offset):(segmentindex[i]+offset+theend)]) # the mean of the segment
+        A1 = np.mean(clickamp[(segmentindex[i]+offset):segmentindex[i]])
+        A2 = np.mean(clickamp[(segmentindex[i]):(segmentindex[i]+offset+theend)])
+        cpeak2peak = [] 
+        for j in range((segmentindex[i]+offset+1),(segmentindex[i]+offset+theend)):  # Attempt to generate a list of the peak2peak values from clickpoint to clickpoint
+            cpeak2peak.append(np.abs(Amean - clickamp[j])) # difference between the clickpoint and the mean of the samples surrounding the gap
+            print(j,clickamp[j],np.abs(Amean - clickamp[j]))
+        cpmax = np.max(cpeak2peak)
+        cpmin = np.min(cpeak2peak)     
+        cpmean = np.mean(cpeak2peak)
+        print(f'cpeak2peak = {cpeak2peak} , cpmin = {cpmin}, cpmean = {cpmean} cpmax = {cpmax}')
+        
+        tmin = np.min(clicktimedifference) 
+        tmed = np.median(clicktimedifference)
+        # rate goes as 7th variable
+        #
+        #    segment[0] = segmentclicktime
+        #    segment[1]segmentinterval 
+        #    segment[2]clickamp segment starting clickpoint amplitude
+        #    segment[3] PNEdydx velocity leading into the segment
+        #    segment[4] clickamp segment ending clickpoint amplitude
+        #    segment[5] PNEdydx velocity exiting the segment
+        #    segment [6] index i of this segment 
+        # generate_points inputs:
+        # T1 = time of beginning point      (segment[0]) : segmentclicktime
+        # A1 = Amplitude of leading series of clickpoints
+        # V1 = Velocity at beginning point  (segment[3]) 
+        # T2 = Time of endin point
+        # A2 = Amplitude at ending series of clickpoints 
+        # V2 = Velocity at ending point
+        # rate of points per second
+        # tmed: median time gap
+        # tmin: minimum time gap
+        # cpmin: lowest variation from mean of adjacent clickpoints
+        # cpmax: highest variation from mean of clickpoints
+        # Amean: The mean of adjacent clickpoints
+        # print(segments[i][0],segments[i][1])
+        #
+        # generate_points3 = Build four or five ( or n) clickpoints, with amplitudes that move from segments[2] to segments[4], but
+        #                    with amplitudes of 90% peak from cpmax to cpmin. For instance, with 5 clickpoints:
+        #                    Clockpoint[0] occurs at T1+(T2-T1/6) * 1 with amplitude: (segments[3]-segments[2]/6)* 1
+        #                    Clickpoint[1] occurs at T1+(T2-T1/6) * 2 with amplitude: (cpmax-cpmin)/2+(segments[3]-segments[2]/6) * 2
+        #                    Clickpoint[2] occurs at T1+(T2-T1/6) * 3 with amplitude: -(cpmax-cpmin)/2+(segments[3]-segments[2]/6) * 3
+        #                    Clickpoint[3] occurs at T1+(T2-T1/6) * 4 with amplitude: (cpmax-cpmin)/2+(segments[3]-segments[2]/6) * 4
+        #                    Clickpoint[4] occurs at T1+(T2-T1/6) * 5 with amplitude: -(segments[3]-segments[2]/6)* 5
+        #              # generate_points3(T1, A1, V1, T2, A2, V2, Numpoints, Tmed, Tmin, Alow, Ahigh,Amean)                   
+        #points = generate_points3(segments[i][0], segments[i][2], segments[i][3], segments[i][0]+segments[i][1], \
+        #                segments[i][4], segments[i][5], rate, tmed, tmin, cpmin, cpmax,np.mean(clickamp[(segmentindex[i]+offset):(segmentindex[i]+offset+theend)]))
+        points = generate_points3(segments[i][0], segments[i][2], segments[i][3], segments[i][0]+segments[i][1], \
+                        segments[i][4], segments[i][5], rate, tmed, tmin, cpmin, cpmax, Amean, cpmean) # Make the mean halfway between the two clickpoints
+        print(f'Points generated: \n{points}')
+        frogdna.append(points)   # Add the newly created clickpoints to the list for integration into the main clickpoint file for this component at the timing gaps.
+        print('\n\n')
+        
+    # At this point, we have four parallel lists:
+    # segmentindex[] 
+    # segmenttime[]
+    # segmentvalue[]
+    # frogdna[]
+    # Insert the new clickpoints into the original clickpoint list.
+    # insert them, starting at the end gap and working backward to the first timing gap to preserve the index.
+    # With a segmentindex and accompanying synthetic clickpoints, 
+    # insert the click points into the clickpoint stream 
+    #
+    # The segment index contains the clickpoint after which we need to append our new synthetic frog dna
+    #
+
+    clicktime_modified = clicktime.copy()  # Make some copies for modification
+    clickamp_modified = clickamp.copy()
+    print(len(clicktime_modified),len(clickamp_modified))  
+    segmentlist = []
+    #
+    # Reverse the clickpoint fills because we'll be filling the LAST timing gap first, and the first timing gap last.
+    #
+    for i in range (0,len(segmentindex)):
+        segmentlist.append([segmentindex[i],segmenttime[i],segmentvalue[i],frogdna[i]])
+    segmentlist.reverse()
+    for segment in segmentlist: # Going through each segment, insert it into the original click point list to fill in those gaps 
+        Frogdna = segment[3]  # generated frogdna clickpoints from generate_points3
+        Frogdna.reverse() # Invert the segment and pack them into the list
+        #
+        # point by point, end to beginning , insert the list of clickpoint times and amplitudes into the main clicktime/clickamp list 
+        # at the index specified at segment[0]+1. This grows the original clicktime/clickamp lists by appending the lists with the synthesized datapoints.
+        #
+        print('FrogDNA segments being inserted into the clickpoint file:')
+        for time,amplitude in Frogdna:
+            print(time,amplitude)
+            clicktime_modified.insert(segment[0]+1,time) 
+            clickamp_modified.insert(segment[0]+1,amplitude)
+    #
+    # Troubles at the beginning and the end of the file when velocities are high...
+    # Set clickpoint[0] and clickpoint[len(ckickpoint)-1] to value of points adjacent to force zero velocity at the beginnign and end of the list.
+    #
+#    clickamp_modified[0] = clickamp_modified[1]
+#    clickamp_modified[len(clickamp_modified)-1] = clickamp_modified[len(clickamp_modified)-2] 
+   
+    return (clicktime_modified,clickamp_modified)
+
+
 #
 # Optimize function checks for unrealistic spikes and optimizes clickpoint placement to minimize high-velocity
 # spikes above the assumed seismometer channel operating bandwidth
 # then provides a modified list of clickpoints along with diagnostic lists
 # such as the clickpoints adjusted and related amplitudes,
-# the testdata derivative, and the spikes that exceed the threshold
+# the testdata derivative, and the spikes that exceed the threshold.
+# Only adjust clickpoints that exceed 1/4 the minmax for the 20 adjacent clickpoints as small changes with asymmetry are
+# likely real.
+# clicktime, clickamp represent click point file for generation of signal.
+# streamtime, streamdata = actual obspy stream from the original clickpoint file, 
 
 def Optimize(clicktime,clickamp,streamtime,streamdata,metadata,time_params):
     # This is a hard rule for now, but may change.
-    #
+
+        
     tr = Maketrace(streamdata,metadata,time_params) # makes a trace from streamdata, a time-history output from PCHIP
     tr2 = tr.copy()
-    tr2.differentiate(edge_order=2)
+    tr2.differentiate(edge_order=2) # Create the differential representing Dy/Dt for this should be roughly symmetrical without huge deviations from sample to sample
     tr2.filter("highpass",freq = metadata['breakpoint'], corners = 2) # single-pole filter above operating frequency to find big spikes
-    testdata = [(sample) for sample in tr2.data] # convert it to an absolute value as we look for excursions
+    testdata = [(sample) for sample in tr2.data] # convert differential channel to an absolute value as we look for excursions
     spiketime,spikeamp = Find_spikes((testdata),streamtime,float(metadata['threshold'])) # test against a threshold
     #
     # Match requires the spiketime match the clicktime within +- delta
@@ -317,6 +731,7 @@ def Optimize(clicktime,clickamp,streamtime,streamdata,metadata,time_params):
     #
     clickminimum = find_minimum_click_interval(clicktime)
     print(f'minimum time between clicks is {clickminimum:0.3f} seconds.')
+
     Clicktime_to_adjust,Clicktime_to_adjust_index = Match(spiketime,clicktime) # find problem clickpoints that made the spikes
     new_clicktime = Adjust(Clicktime_to_adjust_index,clicktime,metadata['shiftlimit']) # Make revised clickpoints
     C2amp = []                   # Make an adjusted Clickpoint_to_amplitude list
@@ -341,9 +756,12 @@ def Import_clickfile(clickfile):
         list = csv.reader(fin)
         clicktime = []
         clickamp = []
+        PNEdydx = [] # This one is going to be a crude estimate of direction and slope by going through the list, setting slope
+        # as change in amplitude as a change in time between clickpoints. Last clickpoint will use slope of zero.
         metadata = {'comment':'','station':'','network':'','component':'','reftime':'01_JAN_1970_00:00:00.000', \
         'starttime':'01_JAN_1970_00:00:00.000','cf':float(1.0),'tc':float(0.0), 'location':'', 'samplerate':float(100.0),\
-        'nsamples':int(0),'polarity':1.0,'threshold':25.0,'breakpoint':16.0,'optimize':'False','shiftlimit':0.085}
+        'nsamples':int(0),'polarity':1.0,'threshold':25.0,'breakpoint':16.0,'optimize':'False','shiftlimit':0.085,\
+        'fillgaps':'False', 'Nograph':'False'}
         for row in list:
             if len(row) > 0:          # skip blank lines
                 r = row[0].split()    # Split up the un-blank lines into discrete values then check them.
@@ -362,34 +780,41 @@ def Import_clickfile(clickfile):
     metadata['shiftlimit'] = float(metadata['shiftlimit'])       
     metadata['cf'] = float(metadata['cf'])
     metadata['tc'] = float(metadata['tc'])
-    metadata['samplerate'] = float(metadata['samplerate'])
-    metadata['nsamples'] = int(((clicktime[len(clicktime)-1]-clicktime[0])*metadata['samplerate'])+1)
+ #   metadata['samplerate'] = float(metadata['samplerate'])
+    metadata['nsamples'] = int(((clicktime[len(clicktime)-1]-clicktime[0])*metadata['samplerate'])+1) # This is the number of samples to generate with interpolation algorithm
     metadata['optimize'] = str2bool(metadata['optimize'])
-
+    metadata['fillgaps'] = str2bool(metadata['fillgaps'])
     first_sampletime    = float(clicktime[0])# Number of seconds ahead of the ref_time in which the first sample actually occurs
     Time_params = Get_time_params(metadata,first_sampletime)
-
     #
     #                       Delta is the average sample period. It is calculated from the offset time of last sample 
     #                       minus offset of first sample / total number of samples.
     # 
-
     metadata['delta']     = (float(clicktime[len(clicktime)-1])-first_sampletime)/(metadata['nsamples'])
     print(f"delta has been set to {metadata['delta']} seconds, which is {1/metadata['delta']} Hz")
+    metadata['samplerate'] = 1/(float(clicktime[len(clicktime)-1])-first_sampletime)/(metadata['nsamples'])
     errtime = False # There is no error time in a mouse click file.
-    return(clicktime,clickamp,errtime,metadata,Time_params)
+    #
+    # Calculate PNEdydx
+    #
+    PNEdydx.append(0) # Append a slope of zero for the first data point
+    for i in range(1,len(clicktime)): # Go to the second-to-last point 
+        dydx = (clickamp[i]-clickamp[i-1]) / (clicktime[i]- clicktime[i-1]) # centimeters / seconds
+        PNEdydx.append(dydx)
+    PNEdydx.append(0) # Append a slope of zero for the last data point
+    return(clicktime,clickamp,PNEdydx,errtime,metadata,Time_params)
 
-
+#
+#  def Export_clickfile: Write the mouse click file representing the vectorized clickpoints of the seismogram to disk.
+#
 def Export_clickfile(metadata,clicktime,clickamp):
-#
-#               Write the mouse click file.
-#
     clickfile = os.path.join(metadata['outfolder'],(metadata['filename']+"_clickpoints.csv"))
     with open(clickfile, mode='w', newline='\n') as mouseclick:
         mouseclick_writer = csv.writer(mouseclick, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
         mouseclick_writer.writerow(['COMMENT',metadata['comment']])
         mouseclick_writer.writerow(['STATION',metadata['station']])
         mouseclick_writer.writerow(['NETWORK',metadata['network']])
+        mouseclick_writer.writerow(['LOCATION',metadata['location']])
         mouseclick_writer.writerow(['COMPONENT',metadata['component']])
         mouseclick_writer.writerow(['CF',metadata['cf']])
         mouseclick_writer.writerow(['TC',metadata['tc']])
@@ -399,6 +824,7 @@ def Export_clickfile(metadata,clicktime,clickamp):
         mouseclick_writer.writerow(['THRESHOLD',metadata['threshold']])
         mouseclick_writer.writerow(['SHIFTLIMIT',metadata['shiftlimit']])
         mouseclick_writer.writerow(['BREAKPOINT',metadata['breakpoint']])
+        mouseclick_writer.writerow(['FILLGAPS',metadata['fillgaps']])
         mouseclick_writer.writerow([])
         mouseclick_writer.writerow(['Clickpoint','Relative_time(seconds)','Amplitude(centimeters)'])
         for i, mouseclicks in enumerate(clicktime,0):
@@ -407,8 +833,8 @@ def Export_clickfile(metadata,clicktime,clickamp):
     return()
 #
 # Load a wavetrack output file with header.
-# header contains the necessary metadata
-# stack contains two element list, of time in seconds since first sample, amplitude in centimeters.
+# The header contains the necessary metadata for creating a miniseed file from the wavetrack project file.
+# The stack contains two element list, of time in seconds since first sample, amplitude in centimeters.
 #    
 def Import_Wavetrack(infile):
     with open(infile,'r') as fin:
@@ -416,8 +842,8 @@ def Import_Wavetrack(infile):
         PNE = []
         metadata = {'comment':'','station':'','network':'','component':'','reftime':'01_JAN_1970_00:00:00.000', \
         'starttime':'01_JAN_1970_00:00:00.000','cf':float(1.0),'tc':float(0.0), 'location':'', 'samplerate':float(100.0),\
-        'nsamples':int(0),'polarity':1.0,'threshold':25.0,'optimize':'False','breakpoint':16.0,'filename':'none',\
-        'shiftlimit':0.085,'outfolder':'C:\\','interpolation':'pchip'}
+        'nsamples':int(0),'polarity':1.0,'threshold':50.0,'optimize':'False','breakpoint':16.0,'filename':'none',\
+        'shiftlimit':0.085,'outfolder':'C:\\','interpolation':'pchip','fillgaps':'False','Nograph':'False'}
         for row in list:
             if len(row) > 0:          # skip blank lines
                 r = row[0].split()    # First seven rows are header and assigned to PNE[0]
@@ -437,11 +863,15 @@ def Import_Wavetrack(infile):
     metadata['polarity']   = float(metadata['polarity'])
     metadata['threshold']  = float(metadata['threshold'])
     metadata['breakpoint'] = float(metadata['breakpoint'])
-    metadata['samplerate'] = float(metadata['samplerate'])
+#    metadata['samplerate'] = float(metadata['samplerate'])
     metadata['cf']         = float(metadata['cf'])
     metadata['tc']         = float(metadata['tc'])
     metadata['shiftlimit'] = float(metadata['shiftlimit']) # shiftlimit is listed in seconds.
     metadata['optimize'] = str2bool(metadata['optimize'])   # Boolean value based in interpretation of text field
+    metadata['starttime'] = metadata['starttime'].upper()
+    metadata['reftime'] = metadata['reftime'].upper()
+    metadata['fillgaps'] = str2bool(metadata['fillgaps'])
+
     #
     #                       Build the time parameters dictionary
     #
@@ -455,14 +885,16 @@ def Import_Wavetrack(infile):
 
     Delta     = (float(PNE[len(PNE)-1][0])-first_sampletime)/(len(PNE)-1)
     metadata['delta'] = Delta                # This is the calculated sample interval, which should coincide with the stated sample rate
+    metadata['samplerate'] = 1/Delta
     metadata['nsamples'] = len(PNE)          # remember to adjust this value when trimming the file to size
+    
     return(metadata,PNE,Time_params)
 
 
 
 #
 #
-# Get Time Parameters: Parse out the start time and reference time, generate UTCDateTime instances
+# Get Time Parameters: (used by import_wavetrack and import_clickfile) Parse out the start time and reference time, generate UTCDateTime instances
 # Times listed for Starttime and Reftime are pre-time correction
 # And compute the difference between start time and reference time, which is starting_sample in seconds
 # beyond the beginning of the raw digitization. This is where we'll make the cut when generating the output.
@@ -489,14 +921,13 @@ def Get_time_params(metadata,first_sampletime):
     Time_params['reftime'] = reftime # [3]
     return(Time_params)
 
+#    PNE2Clicktime: Used by main() to extract the click points from the wavetrack output file as well as create
+#    the PNE_time/PNE_amp lists representing the digitalized signal resulting from those clickpoints.
 #                       Load Data array from the Wavetrack output file
-#                       Samples in file are (no longer) multiplied by 10,000 to convert from
-#                       measurements of centimeters to microns, then it's divided by
-#                       the Amplification (conversion) factor, known as CF (This is done within the dataless SEED file now)
 #                       Use PCHIP to provide a list of click times, and interpolated waveform from those click times.
 
 def PNE2Clicktime(metadata,PNE,Time_params):
-    # version 20210810
+    # version 20240810 - Also pass PNEdydx outside the def for use in fillgaps() if necessary
 
     PNEtime = [] # represents time track of the selected dataset starting from the selected start time
     PNEamplitude = []
@@ -510,19 +941,32 @@ def PNE2Clicktime(metadata,PNE,Time_params):
             PNEamplitude.append(2-float(data[1])*metadata['polarity']) # This is amplitude in centimeters
 
     #
-    #                Process file for click points, then interpolate into smoother waveform
+    #                Process file for click points, then interpolate into smoother waveform with an interpolation method such as pchip
 
     metadata['nsamples'] = len(PNEtime)    # Re-adjust the metadata to account for the trimming of the excess samples
     PNEamp   = np.arange(len(PNEamplitude),dtype=np.float32)
     for n in range(len(PNEamplitude)):      
         PNEamp[n] = np.float32(PNEamplitude[n]) 
-    PNEamp = polynomial(PNEamp, order = 1, plot = False) # polynomial linear trend remove the offset.
+    PNEamp = polynomial(PNEamp, order = 1, plot = False) # remove the offset with a polynomial linear trend .
 
     # Get the clickpoints
     # You need to bring out the estimated instantaneous derivative at the clickpoint as well.
     # Call it clickdydx
-    
+    #
+    # Extrapolate the click points and amplitudes from the wavetrack linearly interpolated points.
+    # Where the wavetrack changes slope, there's a clickpoint. Determine exactly where the two line segments intercept and calculate the time
+    # and amplitude of that line segment intercept point, and make it the clickpoint.
+    #
     PNEclicktime,PNEclickamp,PNEdydx,errtime = WT_to_clickpoint(PNEtime,PNEamp)
+    #
+    # It is HERE that one checks for filling in the timing gaps via metadata parameter fillgaps(clicktime,clickamp,GMTClicktime,PNEdydx,metadata)
+    #
+   
+    if metadata['fillgaps'] == True:
+        print(f"fillgaps option is set to {metadata['fillgaps']}:\n")
+        PNEclicktime, PNEclickamp = fillgaps(PNEclicktime,PNEclickamp,PNEdydx,metadata)
+    #
+    #
     
     if metadata['interpolation'] == 'pchip':
         PNE_time,PNE_amp = Pchip(PNEclicktime,PNEclickamp,len(PNEtime))
@@ -540,7 +984,7 @@ def PNE2Clicktime(metadata,PNE,Time_params):
     Clicktime = []
     for click in PNE_clicktime:
         Clicktime.append(str(click))
-    return(PNE_time,PNE_amp,PNEclicktime,PNEclickamp,Clicktime,errtime)
+    return(PNE_time,PNE_amp,PNEclicktime,PNEclickamp,Clicktime,errtime,PNEdydx)
 
 #
 # Error during processing is usually caused by two wavetrack clickpoints on the same horizontal time slice
@@ -556,11 +1000,12 @@ def log_error(point,x,y,error):
         print(f"Time discrepency of {(error-point[0][0]):2.3f} seconds.") 
         print(f"Use Linear interpolation set sample time to {x:2.3f} seconds.\n")
 
-
+# Line intercept is used to find the exact time of the clickpoint based on where the two slopes intersect.
 #  Here is where the following code is sourced and subsequently adapted to PNE2SAC:
 #  https://stackoverflow.com/questions/20677795/how-do-i-compute-the-intersection-point-of-two-lines
 
-def line_intercept(point): # version 20210810
+
+def line_intercept(point): # version 20250210
                             # Points are configured as [time(x), amplitude(y), slope(m)]
     error = 0
     point1 = point[0]
@@ -573,30 +1018,27 @@ def line_intercept(point): # version 20210810
         error = -1
         interpolated_time = point1[0]+(point2[0]-point1[0])/2.0
         interpolated_amplitude = point1[1]+(point2[1]-point1[1])/2.0
-        return (interpolated_time,interpolated_amplitude,error)
+        return (interpolated_time,interpolated_amplitude,0,error)
     x = (b2 - b1) / (m1 - m2) # Calculate the x position of the interection of the lines
     y = m1 * x + b1 # 
-  #  slope = (m1+m2)/2.0 # average slope halfway between the two points.
-    #slope = m1+((m2-m1)*(x-point1[0])/(point2[0]-point1[0]))
     slope = m1 * (x - point1[0])/(point2[0]-point1[0]) + m2 * (point2[0] - x)/(point2[0]-point1[0])
     # in reality, the slope should be weighted depending on the "closeness" between the two points.
     # point1[0] is time at first point, point2[0] is time at second point, x is time of clickpoint between these two.
-    # If the calculated point falls more than .002 seconds outside of the wavetrack points, assume
+    # If the calculated point falls more than .010 seconds outside of the wavetrack points, assume
     # there is a discontinuity within wavetrack data and interpolate.
     
-    if not point1[0] <= x <= point2[0] and ((x - point1[0] < -.002) or (x - point2[0] > 0.002)) :
+    if not point1[0] <= x <= point2[0] and ((x - point1[0] < -.010) or (x - point2[0] > 0.010)) :
         error = x
         x = point1[0]+(point2[0]-point1[0])/2.0 # interpolate a midpoint
         y = point1[1]+(point2[1]-point1[1])/2.0
-    #slope = 0
-    return (x,y,slope,error) # Pass the miscalculated value for error logging.
+  #      slope = 0  # uncalculatable slope
+    return (x,y,slope,error) # Pass coordinates of the clickpoint plus the miscalculated value for error logging.
 
 
-# (PCHIP stands for Piecewise Cubic Hermite Interpolating Polynomial)
-# clues taken from here: https://stackoverflow.com/questions/31221444/intuitive-interpolation-between-unevenly-spaced-points
+
 
 def WT_to_clickpoint(time,amp): # input the time and amplitude series. method describes the desired interpolation method
-    # version 20210810
+    # version 20250131
     # method = 0 [default] = Pchip interpolation methodology
     # method = 1 = spline but this is not yet implemented.
     # Slope = difference in amplitude across two adjacent samples divided by time difference between the time of those two samples
@@ -604,6 +1046,7 @@ def WT_to_clickpoint(time,amp): # input the time and amplitude series. method de
     bslopes = []
     fslopes = []
     deltat = [] # [time[1]-time[0]]
+    dither_ratio = 6 # Detection threshold for flagging samples that bracket a change in slope representing a clickpoint.
     for i in range(1,len(time)):
         deltat.append(time[i]-time[i-1])
     dt = np.mean(deltat) # This is the standard sample rate (IN SECONDS) from the wavetrack output.  
@@ -640,7 +1083,7 @@ def WT_to_clickpoint(time,amp): # input the time and amplitude series. method de
     second_point = False
     for i in range(1,len(slopes)-1): # dont check the first and last item as these are automatically added to the list
         if not second_point:
-            if (np.abs(slopes[i+1] - slopes[i])) > dt/2 :
+            if (np.abs(slopes[i+1] - slopes[i])) > dt/dither_ratio : # dt = samplerate . dt/dither_ratio determines how much 'wiggle' in the slope from sample to sample is allowed before triggering
                 ds.append((slopes[i] - slopes[i-1]))       # from a different click point
                 backslopes.append(bslopes[i])
                 foreslopes.append(fslopes[i])
@@ -691,7 +1134,11 @@ def WT_to_clickpoint(time,amp): # input the time and amplitude series. method de
                 errtime.append(x) # Record whenever a linerly interpolated point exists.
 
     return(PNEclicktime,PNEclickamp,PNEdydx,errtime)
-
+#
+# def Pchip (used for converting the clickpoint list of vectorized clickpoints into a digital signal)
+# (PCHIP stands for Piecewise Cubic Hermite Interpolating Polynomial)
+# clues taken from here: https://stackoverflow.com/questions/31221444/intuitive-interpolation-between-unevenly-spaced-points
+#
 def Pchip(clicktime,clickamp,nsamples): # Bring in clickpoints and output a PCHIPped time series
     # At this point, clicktime represents the time of each click point and clickamp represents amplitude of each mouse click
     x_data = np.array(clicktime)
@@ -726,10 +1173,13 @@ def nointerpolation(time,amp):
     # Create a stream of linearly interpolated points straight from the original wavetrack output file.
     return(time,amp)
 
+#
+# Convert the digitalized list of clickpoints into a SAC stream for export.
+#
 def Create_sacstream(b,metadata,time_params,outfolder):
     #                                          Create the SAC stream
     St_time = time_params['St_time']  + float(metadata['tc'])          # Shortcut for filename below
-    Delta     = (1/float(metadata['samplerate']))
+#    Delta     = metadata['delta'] # (1/float(metadata['samplerate']))
     Network   = metadata['network']
     Component = metadata['component']
     Location  = metadata['location']
@@ -737,7 +1187,7 @@ def Create_sacstream(b,metadata,time_params,outfolder):
     t         = SACTrace(data = b)         
                                  # set the SAC header values
     t.scale  = 1.0               # Set the scale for use with DIMAS software
-    t.delta  = Delta
+    t.delta  = metadata['delta']
     t.nzyear = St_time.year
     t.nzjday = St_time.julday
     t.nzhour = St_time.hour
@@ -770,10 +1220,14 @@ def Create_sacstream(b,metadata,time_params,outfolder):
     #
     with open(outfile,'wb') as sacfile:
         t.write(sacfile)
-    print (" File successfully written: {0} with a start time of {1}".format(outfile,St_time))       
+    print (" File successfully written: {0} with a start time of {1} and sample period of {2:0.3f} seconds".format(outfile,St_time,t.delta))    
     sacfile.close()
     return(t) #  This is the trace that was just written to disk.
 
+#
+# Convert the SAC trace into a miniseed trace for eventual export. Why do it this way? Well, this WAS once a PNE2SAC code, after all.
+#
+#
 def Make_obspy_trace(tr,metadata): # This converts the sac trace tr into an obspy trace then returns an obspy trace
     tr2 = tr.to_obspy_trace()
     #tr.stats.comment    = metadata['comment'] 
@@ -782,11 +1236,12 @@ def Make_obspy_trace(tr,metadata): # This converts the sac trace tr into an obsp
     tr2.stats.channel   = metadata['component'][:3]
     tr2.stats.location  = metadata['location']
     tr2.stats.starttime = starttime
-    tr2.stats.delta = 1/float(metadata['samplerate'])
+    tr2.stats.delta = metadata['delta'] # 1/float(metadata['samplerate'])
     tr2.stats.npts= len(tr2.data)
     tr2.stats.calib = metadata['cf']
     tr2.stats
     return(tr2)
+
 #
 # Maketrace generates an Obspy trace suitable for writing out as a miniseed file
 # as well as useful for plotting, and applying Obspy signal analysis tools.
@@ -795,7 +1250,7 @@ def Make_obspy_trace(tr,metadata): # This converts the sac trace tr into an obsp
 def Maketrace(streamdata,metadata,time_params):
     tr = Trace(data=streamdata)
     tr.data = tr.data.astype('float32')
-    tr.stats['delta']=metadata['delta']
+    tr.stats['delta']= metadata['delta']
     tr.stats['network'] = metadata['network']
     tr.stats['station'] = metadata['station'][:7]
     tr.stats['location'] = metadata['location']
@@ -803,38 +1258,11 @@ def Maketrace(streamdata,metadata,time_params):
     tr.stats['starttime'] = time_params['St_time']+float(metadata['tc']) # Add the time correction here
     return(tr)
 
-
-# PNEPLOT is at present, a legacy code snippet that is unused.
-def PNEplot(PNE,clicktime,clickamp,PNE_time,streamdata,errtime,metadata,time_params):
-    PNEtime = []
-    PNEamplitude = []
-    if len(PNE):
-        # Do this stuff for plotting of the wavetrack data
-        # clicktime,clickamp are from the clickpoint output
-        # PNE_time,streamdata are from the PCHIP algorithm
-        # errtime (if any) are clickpoints with discontinuities
-        # Wavetrack channel is PNE[0],PNE[1]
-        #
-        for data in PNE:
-            if float(data[0]) >= (time_params[5]):  # Starting_sample:  # Discard the unwanted samples from beginning of file 
-                PNEtime.append(float(data[0])) # This is the relative time
-                PNEamplitude.append(2-float(data[1])*metadata['polarity']) # This is amplitude in centimeters
-        PNEamp   = np.arange(len(PNEamplitude),dtype=np.float32)
-        for n in range(len(PNEamplitude)):      
-            PNEamp[n] = np.float32(PNEamplitude[n]) 
-        PNEamp = polynomial(PNEamp, order = 1, plot = False)       
-    if(len(PNEtime)):
-        plt.plot(PNEtime,PNEamp,color='black')
-    if(len(PNE_time)):
-        plt.plot(PNE_time,streamdata,color='green') # Show the PCHIP output
-    plt.scatter(clicktime,clickamp,color='red',s=4) # Show the clickpoints
-    plt.show()
-
+#
 # plot_optimized makes a plot with all the information, from non-optimized/optimized comparisons
 # to clickpoints, to some stats about the digitization.
 # It also calculates some statistics about the streams.
-
-
+#
 def plot_optimized(metadata,time_params,outfolder,PNE,tr1,tr2,errtime,streamtime,clicktime,Clicktime_to_adjust,spiketime,clickamp,spikeamp,testdata,newtestdata,C2amp):
     PNEtime = []
     PNEamplitude = []
@@ -845,7 +1273,7 @@ def plot_optimized(metadata,time_params,outfolder,PNE,tr1,tr2,errtime,streamtime
             if not offset:
             #    print(f'Setting offset to {offset}')
                 offset = float(data[1])
-                print(f'Setting offset to {offset} while data[1] = {data[1]}')
+             #   print(f'Setting offset to {offset} while data[1] = {data[1]}')
             PNEtime.append(float(data[0])) # This is the relative time
             PNEamplitude.append(-1*(float(data[1])-offset)) # This is amplitude in centimeters
 
@@ -853,9 +1281,7 @@ def plot_optimized(metadata,time_params,outfolder,PNE,tr1,tr2,errtime,streamtime
     tr4 = tr2.copy()
     tr4.differentiate(edge_order=2)
     tr4.filter("highpass",freq = metadata['breakpoint'], corners = 2) # single-pole filter above operating frequency to find big spikes
-#    tr4.differentiate()
     newtestdata = [sample for sample in tr4.data] # Newly corrected stream
-
     # Report whether or not the file being written has been modified with the optimization algorithm
     if metadata['optimize']:
         waveselect = "optimized"
@@ -865,31 +1291,39 @@ def plot_optimized(metadata,time_params,outfolder,PNE,tr1,tr2,errtime,streamtime
         errors = "Number of discontinuities in this file = "+str(len(errtime))
     else:
         errors = "Sourced from click file."
+
     adjusteds = "Number of clickpoints that exceed threshold = "+str(len(Clicktime_to_adjust))
     optimized = (f"Optimization algorithm: {metadata['threshold']} x rms trigger w/ {metadata['breakpoint']} Hz highpass filter.")
     shiftlimit = (f"Shift limit = {metadata['shiftlimit']}")
-    outputselect = (f"Final output file represents the {waveselect} waveform.")
+    if not errtime:
+        outputselect = (f"Final output file represents the {waveselect} waveform.")
+    else:
+        outputselect = (f"Due to existing discontinuitie(s), no output files are generated.")
+
     fig, axs = plt.subplots(3)
     fig.suptitle(f"{optimized}\n{shiftlimit}\n{errors}\n{adjusteds}\n{outputselect}")
     fig.text(0.06, 0.5, 'Amplitude (centimeters)', ha='center', va='center', rotation='vertical')
-    fig.set_size_inches(18.0,9.0)
-
+    fig.set_size_inches(15.0,10.0)
     xmin = 0
     xmax = clicktime[len(clicktime)-1]
+    
+#                                       For zoomed-in plots that emphasize the clickpoints in need of adjustment, set the boundaries thus:
+
     if len(Clicktime_to_adjust) > 1:
-            if Clicktime_to_adjust[0] > 10:
-                xmin = Clicktime_to_adjust[0]-10
-            if  (clicktime[len(clicktime)-1] - Clicktime_to_adjust[len(Clicktime_to_adjust)-1])  > 10: 
-                xmax = Clicktime_to_adjust[len(Clicktime_to_adjust)-1]+10
+            if Clicktime_to_adjust[0] > 30:
+                xmin = Clicktime_to_adjust[0]-30
+            if  (clicktime[len(clicktime)-1] - Clicktime_to_adjust[len(Clicktime_to_adjust)-1])  > 60: 
+                xmax = Clicktime_to_adjust[len(Clicktime_to_adjust)-1]+60
     else:
         xmin = clicktime[0]
         xmax = clicktime[len(clicktime)-1]
+        
     #
     # Set the limits for each of the three subplots
     #
-    axs[0].set_xlim([xmin,xmax])
-    axs[1].set_xlim([xmin,xmax])
-    axs[2].set_xlim([xmin,xmax])
+    axs[0].set_xlim([xmin,xmax]) # Set the upper plot to zoom in ten seconds before the first adjusted clickpoint to ten seconds after the last adjusted clickpoint
+    axs[1].set_xlim([clicktime[0],clicktime[len(clicktime)-1]]) # Set the middle plot to show the whole waveform
+    axs[2].set_xlim([xmin,xmax]) # Set the threshold plot to the same as the top plot.
     #
     # Annotate the three subplots
     #
@@ -899,7 +1333,7 @@ def plot_optimized(metadata,time_params,outfolder,PNE,tr1,tr2,errtime,streamtime
     #
     # Add an error bar onto the top plot for any discontinuities that might be present.
     #
-    axs[0].bar(errtime, height = np.max(tr1.data)-np.min(tr1.data), width=.02, bottom=np.min(tr1.data), align='center',color = "green",fill=True)
+    axs[0].bar(errtime, height = np.max(tr1.data)*2, width=.2, bottom=np.min(tr1.data)*2, align='center',color = "green",fill=True)
     #
     # Plot the original PNE stream of interpolated points, if they exist.
     #
@@ -912,26 +1346,30 @@ def plot_optimized(metadata,time_params,outfolder,PNE,tr1,tr2,errtime,streamtime
     axs[0].scatter(clicktime,clickamp,color = 'blue',s=8) # original clickpoints
     axs[0].plot(streamtime,tr2.data,color='red',label = "Modified trace",linewidth = 1) # optimized trace overlay
     axs[1].plot(streamtime,tr2.data,color='red') # optimized trace n second plot
-    if C2amp:
+    if C2amp: # C2amp represents the clickpoints that is are candidates to adjust, if the optimizer is turned on.
         axs[0].scatter(Clicktime_to_adjust,C2amp,color = 'red',s=24) # adjusted clickpoints
     if spiketime:
         axs[2].scatter(spiketime,spikeamp,color = 'red',s=8) # Where threshold is exceeded
-    if testdata:
-        axs[2].plot(streamtime,testdata,color='blue', linewidth = 2) # trigger channel
+    if testdata: # trigger channel for finding the clickpoints that exceed the threshold set by the operator.
+        axs[2].plot(streamtime,testdata,color='blue', linewidth = 2) 
     axs[2].plot(streamtime,newtestdata,color='red',linewidth = 1)
     #
     # Add documentation to the plot
     #
     ftime = (f"{St_time.year}.{St_time.month:02.0f}.{St_time.day:02.0f}.{St_time.hour:02.0f}.{St_time.minute:02.0f}.{St_time.second:02.0f}")
     filename = metadata['network']+"."+metadata['station']+"."+metadata['location']+"."+metadata['component']+"."+ftime
-    filenametitle = (f"Digitized channel name: {os.path.join(outfolder,filename)}.mseed\n{metadata['comment']}")
+    filenametitle = (f"Digitized channel name: {os.path.join(outfolder,filename)}.mseed\n{metadata['comment']}\n PNE2SAC version {__version__}")
     fig.text(0.5, .0625, filenametitle, ha='center', va='center' , rotation='horizontal')
     plt.savefig(os.path.join(outfolder,filename+".png"))
-    plt.show()
-
+    if metadata['Nograph']: # For batch processing of export files the plot is saved to disk and not pushed to the user's screen.
+        plt.close()
+    else:
+        plt.show()
+    return()
+    
+    
 def main():
-#                               Parse the command line switches
-    optioncount = len(sys.argv)
+#                               Parse the command line switches and set the defaults
     Folder = False  # Treat the input as a single file unless the -folder command line switch is present.
     SAC = True      # Always make sac files in this version.
     MSEED = True    # Always generate a miniseed file, unless -display is present as a command line switch
@@ -941,180 +1379,204 @@ def main():
     filelist = []
     Wavetrack = True
     Clickfile = False
-    infolder=""
+    Fillgaps = False
+    Nograph = False
+    Logfile = True   # Changed for Dan's batch processing , normally is False
+    infile = ''
+    infolder="./"                              # Assume user CWD is the same folder as the target file until specified otherwise
+    outfolder = ".\\"                         
     extension = '.txt'
+    
+    args=parser.parse_args()                  # parse the arguments supplied to the program. 
+    if args.clickfile:                        # By default the extension is .txt so change it for clickfiles to .csv   
+            Clickfile = True                  # Switch to clickfile processing and don't try to extract clickpoints.
+            Wavetrack = False
+            extension = ".csv"                # change the default extenstion from .txt to .csv 
+    if extension in args.filename:            # Options are clickfile, wavetrack output file, or a folder. 
+            filelist.append(args.filename)    # a single file has been speficied within the filelist field.
+            infolder = args.filename[:args.filename.rfind("\\")]  # The input folder for this file.
+            infile = args.filename            # The file name of the input file.
+    if args.folder:                           # If -folder option, then the target is not a file name but is instead infolder.
+            try:
+                Folder = True                 # This means the first instance following folder represents the folder name.
+                infolder = args.filename
+                filelist = os.listdir(args.filename)
+            except:
+                print("Warning! No folder specified within arguments. Check syntax.")
+    if args.nograph:                          # Don't output the graph at the end (for batch processing of wavetrack files)
+            Nograph = True
+    if args.logfile:                          # Set text output to a log file within the destination folder.
+            Logfile = True
+    if args.optimize:                         # Enable optimization algorithm to fine tune clickpoints
+            metadata['optimize'] = True       # Superceded if optimize is specified within the file header
+    if args.fillgaps:
+            metadata['fillgaps'] = True       # this will be superceded if fillgaps is specified within the file header.
+    if args.display:                          # Only display the waveforms, don't overwrite the existing sac and miniseed files within the folder.
+            SAC = False
+            MSEED = False
 
-    if optioncount > 1:
-        for i,args in enumerate(sys.argv): # Check to see if alternate sample rate is specified
-            if '-sps' in args.lower():
-                Sps = float(args[4:])
-                print(f'Sample rate requested = {Sps} samples per second')
-            elif '-sac' in args.lower():
-                SAC = True
-            elif '-clickfile' in args.lower():
-                Clickfile = True
-                Wavetrack = False
-                extension = ".csv"
-            elif '-folder' in args.lower():
-                try:
-                    Folder = True # This means the first instance following folder represents the folder name.
-                    infolder = sys.argv[i+1]
-                    filelist = os.listdir(sys.argv[i+1])
-                except:
-                    print("Warning! No folder specified within arguments. Check syntax.")
-            elif '.' in args.lower() and i!=0: # A file name has been specified.
-                infile = args
-                filelist.append(infile)
-            elif '-display' in args.lower():
-                SAC = False
-                MSEED = False
-#        print(f"Clickfile = {Clickfile}, Wavetrack = {Wavetrack}, filename = {infile}")
+    Sps = float(args.sps)                     # Set the pchip sample rate which by default is 100 sps (about 10X oversampling) for good amplitude resolution in the time domain.
 
-        outfolder = ".\\"                          # Assume user has specified a local file
-        if infile.rfind("\\") > 1:                 # unless a folder is in the name.
-            outfolder = infile[:infile.rfind("\\")]
+    if args.filename.rfind("\\") > 1:                 # unless a folder is in the name.
+        outfolder = args.filename[:args.filename.rfind("\\")]
 
-        for n in range(len(filelist)):
-            if extension in filelist[n]:
-                if len(filelist)>1:
-                    infile = infolder+"/"+filelist[n]
-
-                #if infile.find('.') > 0:
-                #    outfile = infile[:infile.find('.')]+'.sac'
-                #    seedfile = infile[:infile.find('.')]+'.mseed'
-                    
-                #else:
-                #    outfile = infile +'.sac'
-                #    seedfile = infile + '.mseed'
-                outfolder = ".\\"                          # Assume user has specified a local file
-                if infile.rfind("\\") > 1:                 # unless a folder is in the name.
-                    outfolder = infile[:infile.rfind("\\")]
-
+    for n in range(len(filelist)):            # filelist normally has but one entry except in the case of being a folder in which case the code will concurrently convert files.
+        if extension in filelist[n]:          # Ensure that the file is a valid input file with valid extension, (.txt or .csv depending on the switch settings)
+            if len(filelist)>1:
+                infile = os.path.join(infolder,filelist[n])
+            outfolder = ".\\"                          # Assume user has specified a local file
+            if infile.rfind("\\") > 1:                 # unless a folder is embedded within the name.
+                outfolder = infile[:infile.rfind("\\")]
+#
+# Establish link to an standard output file for the log.
+#
+            if (Logfile or Nograph):                                # Turn off the graph at the end so that the code can be run in batch mode from Jupyter Notebook
+                print(f" Outfolder set to: {outfolder} \nRedirecting all output to {infile[:infile.rfind('.')]}.log")
+                sys.stdout = open(infile[:infile.rfind(".")]+'.log','w')
+#
+#            Document the PNE2SAC version and run time for this code execution within the log file.
+#
+            print(f'\nPNE2SAC Version {__version__} executed on {time.asctime(time.gmtime())} UTC\n')
 #
 #                 Import the wavetrack output file or the clickfile
 #
-                if Wavetrack:
-                    metadata,PNE,time_params = Import_Wavetrack(infile)
-                    streamtime,streamamp,clicktime,clickamp,GMTClicktime,errtime     = PNE2Clicktime(metadata,PNE,time_params)
-                    streamdata        = np.arange(len(streamamp),dtype=np.float32)
-                    for n in range(len(streamamp)): #   Load the array with time-history data
-                        streamdata[n] = np.float32(streamamp[n])
-                    St_time = time_params['St_time'] + float(metadata['tc'])
-                    print(f"Importing Wavetrack file {infile}:")
-                if Clickfile:
-                    #print("Trying to import clickfile")
-                    PNE = []
-                    clicktime,clickamp,errtime,metadata,time_params = Import_clickfile(infile)
-                    streamtime,streamamp     = Pchip(clicktime,clickamp,metadata['nsamples'])
-                    streamdata        = np.arange(len(streamamp),dtype=np.float32) # b = time history intended for placing within the miniseed stream
-                    for n in range(len(streamamp)):                                #   Load the array with time-history data
-                        streamdata[n] = np.float32(streamamp[n])
-                    St_time = time_params['St_time']+ float(metadata['tc'])
-                    print(f"Importing Clickfile {infile}:")
+            if Wavetrack:
+                metadata,PNE,time_params = Import_Wavetrack(infile)
+                if Fillgaps:                           # Set the fillgaps switch True
+                    metadata['fillgaps'] = True
+#
+#               Process wavetrack points into a time-history stream at the specified sample rate
+#                    
+                streamtime,streamamp,clicktime,clickamp,GMTClicktime,errtime,PNEdydx     = PNE2Clicktime(metadata,PNE,time_params) # Extract the clickpoints from the WT output file
+                streamdata        = np.arange(len(streamamp),dtype=np.float32)
+                for n in range(len(streamamp)):        #   Load the array with time-history data
+                    streamdata[n] = np.float32(streamamp[n])
+                St_time = time_params['St_time'] + float(metadata['tc'])
+                print(f"Importing Wavetrack file {infile}:")
+#
+#               Import the clickfile of previously generated clickpoints. 
+#
+            if Clickfile: 
+                PNE = []
+                clicktime,clickamp,PNEdydx,errtime,metadata,time_params = Import_clickfile(infile)
+                if Fillgaps:
+                    metadata['fillgaps'] = True
                 #
-                #                             Print status lines 
+                # Here, we check for if timing gaps should be filled via fillgaps(clicktime,clickamp,GMTClicktime,PNEdydx,metadata)
+                # Return a modified version of clicktime,clickamp, metadata, if fillgaps = True
                 #
-               # print(metadata)
-                print( "\nSample rate = {0:2.3f} \nNumber of samples = {1}".format( \
-                      1/float(metadata['delta']),len(streamdata)))
-                if len(PNE):
-                    print( "First_sampletime = {0} seconds, last_sampletime = {1:2.3f} seconds.".format( \
-                           float(PNE[0][0]),float(PNE[len(PNE)-1][0])))
-                    print(f"Starting sample for the time slice occurs at {float(time_params['St_time']-time_params['Rf_time'])} seconds.") 
-#                print(f"St_time = {St_time.hour:02.0f}:{St_time.minute:02.0f}:{St_time.second:02.0f}.{int(St_time.microsecond/1000)}")
-                print(f"Time correction = {metadata['tc']} seconds.")
-                print(f"starttime = {time_params['starttime']}")
-                if errtime:
-                    print(f"There are {len(errtime)} discontinuities in this file.\n")
-                    if len(errtime):
-                        print("Repair discontinuities in Wavetrack output file, then re-run PNE2SAC.")
+                if metadata['fillgaps']:
+                    clicktime, clickamp = fillgaps(clicktime,clickamp,PNEdydx,metadata)
+#
+#               Process the clickpoints into a time-history stream at the specified sample rate.
+#               
+                streamtime,streamamp     = Pchip(clicktime,clickamp,metadata['nsamples'])
+                streamdata        = np.arange(len(streamamp),dtype=np.float32) # b = time history intended for placing within the miniseed stream
+                for n in range(len(streamamp)):                                #   Load the array with time-history data
+                    streamdata[n] = np.float32(streamamp[n])
+                St_time = time_params['St_time']+ float(metadata['tc'])
+                print(f"Importing Clickfile {infile}:")
+            #
+            #                             Graphs are turned on/off depending on whether this is run as a stand-alone code of as part of a list of many files.
+            #
+            if Nograph:
+                metadata['Nograph'] = True
+            else:
+                metadata['Nograph'] = False
+#
+#           Print out diagnostics for the conversion of this file
+#
+            print( "\nSample rate = {0:2.3f} \nNumber of samples = {1}".format( \
+                  1/float(metadata['delta']),len(streamdata)))
+            if len(PNE):
+                print( "First_sampletime = {0} seconds, last_sampletime = {1:2.3f} seconds.".format( \
+                       float(PNE[0][0]),float(PNE[len(PNE)-1][0])))
+                print(f"Starting sample for the time slice occurs at {float(time_params['St_time']-time_params['Rf_time'])} seconds.") 
+            print(f"Time correction = {metadata['tc']} seconds.")
+            print(f"starttime = {time_params['starttime']}")
+            #
+            # errors within the clickpoint calculations due to corrupted wavetrack clickpoints (typically two clickpoints on the same pixel on time axis)
+            #
+            if errtime:            # Discontinuities within the file mean there are errors in the wavetrack project file in need of correction. Dont output faulty files.
+                QCcheck = False
+                print(f"There are {len(errtime)} discontinuities in this file.\n")
+                if len(errtime):
+                    print("Repair discontinuities in Wavetrack output file, then re-run PNE2SAC.")
+            #
+            #               Calculate optimized trace even if it is unused.
+            #               Calculate the optimized version of the clickpoint stream 
+            #               
+            new_clicktime,clickamp,Clicktime_to_adjust,C2amp,testdata,spiketime,spikeamp = \
+            Optimize(clicktime,clickamp,streamtime,streamdata,metadata,time_params)
+            New_streamtime,New_streamamp     = Pchip(new_clicktime,clickamp,metadata['nsamples']) # Make new PCHIP interpolation
+            tr1 = Maketrace(streamdata,metadata,time_params) # makes a trace from old streamdata, a time-history output from PCHIP
+            tr2 = Maketrace(New_streamamp,metadata,time_params) # generate a new trace from revised clickpoints.
+            tr3 = tr1.copy()
+            tr3.filter("highpass",freq = metadata['breakpoint'], corners = 1) # single-pole filter above operating frequency to find big spikes
+            tr4 = tr2.copy()
+            tr4.differentiate(edge_order=2)
+            tr4.filter("highpass",freq = metadata['breakpoint'], corners = 2) # single-pole filter above operating frequency to find big spikes
+            newtestdata = [sample for sample in tr4.data] # Newly corrected stream
+            #
+            # At this point, we have the original trace tr1, optimized trace tr2, and the trigger channel from the original at tr3.
+            #
+            # Generate the file name for this dataset and place it in metadata to pass it to other defs for use in saving and plotting.
+            #
+            ftime = (f"{St_time.year}.{St_time.month:02.0f}.{St_time.day:02.0f}.{St_time.hour:02.0f}.{St_time.minute:02.0f}.{St_time.second:02.0f}")
+            filename = metadata['network']+"."+metadata['station']+"."+metadata['location']+"."+metadata['component']+"."+ftime
+            metadata['filename'] = filename
+            metadata['outfolder'] = outfolder
+            print(f"\nNumber of triggers in original channel = {len(spiketime)}; Number of clickpoints adjusted = {len(Clicktime_to_adjust)}")
+            print(f"Maximum allowable shift of a clickpoint is defined as {metadata['shiftlimit']} seconds.")
+            print(f"mean of original stream trigger = {np.mean(np.abs(testdata)):.2e} mean of modified stream trigger = {np.mean(np.abs(newtestdata)):.2e}")
+            print(f"max spike amplitude of original stream = {np.max(np.abs(testdata)):.2e} max spike amplitude (modified) stream = {np.max(np.abs(newtestdata)):.2e}")
+            print(f"%reduction in spike amplitude: {(1-np.max(np.abs(newtestdata))/np.max(np.abs(testdata)))*100.:02.1f} %\n")
+            outfile = ''
+            if QCcheck: # Assuming the waveforms passed quality check, save the files
                 #
-                #              Calculate optimized trace
+                # export the click file as either optimized or original
                 #
-#                if metadata['optimize']:
-                new_clicktime,clickamp,Clicktime_to_adjust,C2amp,testdata,spiketime,spikeamp = \
-                Optimize(clicktime,clickamp,streamtime,streamdata,metadata,time_params)
-
-#                else:
-#                    new_clicktime = clicktime
-#                    Clicktime_to_adjust = [clicktime[0],clicktime[len(clicktime)-1]]
-#                    C2amp = False
-#                    spiketime = False
-#                    testdata = False
-#                    spikeamp = False
-    
-                New_streamtime,New_streamamp     = Pchip(new_clicktime,clickamp,metadata['nsamples']) # Make new PCHIP interpolation
-                tr1 = Maketrace(streamdata,metadata,time_params) # makes a trace from old streamdata, a time-history output from PCHIP
-                tr2 = Maketrace(New_streamamp,metadata,time_params) # generate a new trace from revised clickpoints.
-                tr3 = tr1.copy()
-                tr3.filter("highpass",freq = metadata['breakpoint'], corners = 1) # single-pole filter above operating frequency to find big spikes
-                tr4 = tr2.copy()
-                tr4.differentiate(edge_order=2)
-                tr4.filter("highpass",freq = metadata['breakpoint'], corners = 2) # single-pole filter above operating frequency to find big spikes
-#    tr4.differentiate()
-                newtestdata = [sample for sample in tr4.data] # Newly corrected stream
-
+                if SAC or MSEED:
+                    if metadata['optimize']:
+                        Export_clickfile(metadata,new_clicktime,clickamp)
+                    else:
+                        Export_clickfile(metadata,clicktime,clickamp)
                 #
-                # At this point, we have the original trace tr1, optimized trace tr2, and the trigger channel from the original at tr3.
+                # Write out the SAC file
                 #
+                if SAC:   # If user selected SAC files, write a SAC file
+                    if metadata['optimize']:
+                        print('Using the optimized trace to create the SAC file.')
+                        Create_sacstream(New_streamamp,metadata,time_params,outfolder)
+                    else:
+                        print('Using the original trace without optimization to create the SAC file.')
+                        Create_sacstream(streamdata,metadata,time_params,outfolder)
                 #
-                # Generate the file name for this dataset and place it in metadata to pass it to other defs for use in saving and plotting.
+                # Write out the miniseed file
                 #
-
-                ftime = (f"{St_time.year}.{St_time.month:02.0f}.{St_time.day:02.0f}.{St_time.hour:02.0f}.{St_time.minute:02.0f}.{St_time.second:02.0f}")
-                filename = metadata['network']+"."+metadata['station']+"."+metadata['location']+"."+metadata['component']+"."+ftime
-                metadata['filename'] = filename
-                metadata['outfolder'] = outfolder
-                print(f"\nNumber of triggers in original channel = {len(spiketime)}")
-                print(f"Number of clickpoints adjusted = {len(Clicktime_to_adjust)}")
-                print(f"Maximum allowable shift of a clickpoint was defined as {metadata['shiftlimit']} seconds.")
-                print(f"mean of original stream trigger channel = {np.mean(np.abs(testdata)):.2e} \nmean of modified stream trigger channel = {np.mean(np.abs(newtestdata)):.2e}")
-                print(f"max spike amplitude of original stream = {np.max(np.abs(testdata)):.2e}\nmax spike amplitude of modified stream = {np.max(np.abs(newtestdata)):.2e}")
-                print(f"%reduction in spike amplitude: {(1-np.max(np.abs(newtestdata))/np.max(np.abs(testdata)))*100.:02.1f} %\n")
-
-                if QCcheck: # Assuming the waveforms passed quality check, save the files
-                    #
-                    # export the click file as either optimized or original
-                    #
-                    if SAC or MSEED:
-                        if metadata['optimize']:
-                            Export_clickfile(metadata,new_clicktime,clickamp)
-                        else:
-                            Export_clickfile(metadata,clicktime,clickamp)
-                    #
-                    # Write out the SAC file
-                    #
-                    if SAC:   # If user selected SAC files, write a SAC file
-                        if metadata['optimize']:
-                            print('Using the optimized trace to create the SAC file.')
-                            Create_sacstream(New_streamamp,metadata,time_params,outfolder)
-                        else:
-                            print('Using the original trace without optimization to create the SAC file.')
-                            Create_sacstream(streamdata,metadata,time_params,outfolder)
-                    #
-                    # Write out the miniseed file
-                    #
-                    if MSEED: # If user selected MSEED files, write a mseed file
-                        outfile = os.path.join(outfolder,filename+".mseed")
-                        if metadata['optimize']:
-                            tr = tr2
-                            print(f"Using the optimized trace to create miniseed file.")       
-                        else:
-                            tr = tr1 
-                            print(f"Using the original trace to create miniseed file.")
-                        tr.write(outfile,format = "MSEED")
-                        print(f"File succesfully written: {outfile}")
-
-                else: # Flagged QCcheck has failed so no output is generated.
-                    print('Quality check failure; Check for discontinuities and re-edit the Wavetrack file.')
-                    print('No SAC or miniseed files written to disk for this waveform.')        
-                plot_optimized(metadata,time_params,outfolder,PNE,tr1,tr2,errtime,streamtime,clicktime,Clicktime_to_adjust,spiketime,clickamp,spikeamp,testdata,newtestdata,C2amp)
-        
-    else:
-        print ("Useage: PNE2SAC Wavetrack_exportfile.txt")
-        print ("Or, PNE2SAC -clickfile PNE2SAC_clickfile.csv\n")
-        print ("No input file was specified.")
-        print (f"Number of input argments: {len(sys.argv)} = {sys.argv}")
+                if MSEED: # If user selected MSEED files, write a mseed file
+                    outfile = os.path.join(outfolder,filename+".mseed")
+                    if metadata['optimize']:
+                        tr = tr2
+                        print(f"Using the optimized trace to create miniseed file. \nSample period = {tr.stats['delta']}")       
+                    else:
+                        tr = tr1 
+                        print(f"Using the original trace to create miniseed file. \nSample period = {tr.stats['delta']}")
+                    tr.write(outfile,format = "MSEED")
+                    print(f"File succesfully written: {outfile}\n\n")
+            else: # Flagged QCcheck has failed so no output is generated.
+                print('Quality check failure; Check for discontinuities and re-edit the Wavetrack file.')
+                print('No SAC or miniseed files written to disk for this waveform.')
+            #
+            # Plot the resulting streams, including the original wavetrack output, error bars, clickpoint list, and interpolated waveform, plus spikes, discontinuities, etc.
+            #
+            plot_optimized(metadata,time_params,outfolder,PNE,tr1,tr2,errtime,streamtime,clicktime,Clicktime_to_adjust,spiketime,clickamp,spikeamp,testdata,newtestdata,C2amp)
+            #
+            # Restore the screen output so script can terminate
+            #
+            if (Logfile or Nograph):
+                sys.stdout.close()
+                sys.stdout = sys.__stdout__ 
 
 #
 # Check and run the main function here:
